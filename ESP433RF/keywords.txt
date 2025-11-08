@@ -1,0 +1,46 @@
+#######################################
+# Syntax Coloring Map For Ling433RF
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+ESP433RF	KEYWORD1
+RFSignal	KEYWORD1
+EncodingMode	KEYWORD1
+SendMode	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+end	KEYWORD2
+receiveAvailable	KEYWORD2
+receive	KEYWORD2
+parseSignal	KEYWORD2
+send	KEYWORD2
+setEncodingMode	KEYWORD2
+setInvertSignal	KEYWORD2
+setRepeatCount	KEYWORD2
+setTiming	KEYWORD2
+setProtocol	KEYWORD2
+setPulseLength	KEYWORD2
+getSendCount	KEYWORD2
+getReceiveCount	KEYWORD2
+resetCounters	KEYWORD2
+setReceiveCallback	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+ENC_NONE	LITERAL1
+ENC_NIBBLE	LITERAL1
+ENC_BYTE	LITERAL1
+ENC_FULL24	LITERAL1
+ENC_LSB_FIRST	LITERAL1
+SEND_GPIO	LITERAL1
+SEND_RCSWITCH	LITERAL1
+

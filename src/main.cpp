@@ -1,438 +1,193 @@
 #include <Arduino.h>
-#include <HardwareSerial.h>
-// 可选：使用RCSwitch库发送（更可靠的编码）
-// 取消注释下面的行来启用RCSwitch库（需要先在platformio.ini中添加库依赖）
+// 启用RCSwitch库支持
 #define USE_RCSWITCH 1
-#ifdef USE_RCSWITCH
-#include <RCSwitch.h>
-RCSwitch mySwitch = RCSwitch();
-#endif
+#include <ESP433RF.h>
+#include <Preferences.h>  // ESP32闪存存储库
 
 // 硬件引脚定义
 #define TX_PIN 14       // 发射模块DATA引脚
 #define RX_PIN 18       // 接收模块数据引脚
+#define REPLAY_BUTTON_PIN 0  // 复刻按钮GPIO引脚（绑定到boot按键，按下时发送复刻信号）
+#define LED_PIN 21     // LED指示灯引脚
 
-// 1527编码时序参数（微秒）
-// 标准1527编码时序：基础脉宽约320-380μs
-#define T_BASE 320      // 基础时间单位（标准值）
-#define T0_HIGH T_BASE        // 逻辑0：短高+长低
-#define T0_LOW (T_BASE * 3)   
-#define T1_HIGH (T_BASE * 3)  // 逻辑1：长高+短低
-#define T1_LOW T_BASE         
-#define SYNC_HIGH (T_BASE * 31) // 同步码：很长高+短低
-#define SYNC_LOW T_BASE
+// 当前发送的信号（用于验证，通过串口命令发送时记录）
+RFSignal currentSent = {"", ""};
 
-// 测试配置
-#define TEST_ADDRESS "62E7E8"
-#define TEST_KEY "31"
-#define SEND_INTERVAL 5000  // 发送间隔5秒
+// 复刻功能：保存接收到的信号
+#define REPLAY_BUFFER_SIZE 10
+RFSignal replayBuffer[REPLAY_BUFFER_SIZE];
+int replayBufferIndex = 0;
+int replayBufferCount = 0;
+RFSignal lastReceived = {"", ""};  // 最后接收到的信号
 
-// 随机地址码数组（10个）
-#define RANDOM_SIGNAL_COUNT 10
-struct RandomSignal {
-  String address;
-  String key;
-  String name;
+// 复刻模式状态
+bool replayMode = false;           // 是否处于复刻模式（等待接收信号）
+RFSignal capturedSignal = {"", ""}; // 捕获的信号（用于GPIO触发发送）
+bool signalCaptured = false;       // 是否已捕获信号
+
+// LED状态管理
+enum LEDState {
+  LED_OFF,      // 熄灭（没有复刻信号）
+  LED_BLINK,    // 快闪（复刻状态，等待接收信号）
+  LED_ON        // 常亮（完成复刻，已捕获信号）
 };
-
-RandomSignal randomSignals[RANDOM_SIGNAL_COUNT] = {
-  {"62E7E8", "31", "信号1"},
-  {"A3B4C5", "32", "信号2"},
-  {"D6E7F8", "33", "信号3"},
-  {"1A2B3C", "34", "信号4"},
-  {"4D5E6F", "35", "信号5"},
-  {"7A8B9C", "36", "信号6"},
-  {"AB12CD", "37", "信号7"},
-  {"EF34AB", "38", "信号8"},
-  {"5678EF", "39", "信号9"},
-  {"9ABC12", "3A", "信号10"}
-};
-
-// 当前发送的信号（用于验证）
-String currentSentAddress = "";
-String currentSentKey = "";
-
-// 发送模式：0=GPIO手动编码, 1=RCSwitch库
-#ifndef USE_RCSWITCH
-#define SEND_MODE 0  // 默认使用GPIO方式
-#else
-#define SEND_MODE 1  // 使用RCSwitch库
-#endif
-
-// 时序测试数组 - 重点测试有效的380μs
-int timingTests[] = {380, 380, 380, 380, 380};  // 固定使用380μs
-int currentTimingIndex = 0;
-bool invertSignal = true;  // 固定使用信号反转
+LEDState currentLEDState = LED_OFF;  // 当前LED状态
 
 // 全局变量
-static int sendCount = 0;
-static int receiveCount = 0;
+static uint32_t sendCount = 0;
+static uint32_t receiveCount = 0;
 static bool testPassed = false;
 
-// 十六进制字符转数值
-uint8_t hexToNum(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  return 0;
-}
+// 创建ESP433RF实例
+ESP433RF rf(TX_PIN, RX_PIN, 9600);
 
-// 编码模式：0=无反转, 1=半字节反转, 2=字节反转, 3=全24位反转, 4=LSB优先
-static int encodeMode = 0;
+// 闪存存储实例
+Preferences preferences;
+const char* PREF_NAMESPACE = "rf_replay";  // 命名空间
+const char* PREF_KEY_ADDRESS = "address";  // 地址码键
+const char* PREF_KEY_KEY = "key";          // 按键值键
+const char* PREF_KEY_CAPTURED = "captured"; // 是否已捕获标志
 
-// 反转4位半字节的位序
-uint8_t reverseBits4(uint8_t val) {
-  return ((val & 0x1) << 3) | ((val & 0x2) << 1) | ((val & 0x4) >> 1) | ((val & 0x8) >> 3);
-}
-
-// 反转整个24位数据的位序
-uint32_t reverseBits24(uint32_t data) {
-  uint32_t result = 0;
-  for (int i = 0; i < 24; i++) {
-    if (data & (1 << i)) {
-      result |= (1 << (23 - i));
-    }
-  }
-  return result;
-}
-
-// 转换为24位数据 - 支持多种编码模式
-uint32_t hexTo24bit(String address, String key) {
-  uint32_t data = 0;
-  String fullHex = address + key;  // 62E7E831
-  
-  // 模式0: 直接组合，不反转
-  if (encodeMode == 0) {
-    for (int i = 0; i < 8; i++) {
-      char c = fullHex.charAt(i);
-      uint8_t val = hexToNum(c);
-      data = (data << 4) | val;
-    }
-  }
-  // 模式1: 半字节反转
-  else if (encodeMode == 1) {
-    for (int i = 0; i < 8; i++) {
-      char c = fullHex.charAt(i);
-      uint8_t val = hexToNum(c);
-      val = reverseBits4(val);
-      data = (data << 4) | val;
-    }
-  }
-  // 模式2: 字节反转（交换字节顺序）
-  else if (encodeMode == 2) {
-    uint8_t bytes[3];
-    for (int i = 0; i < 3; i++) {
-      bytes[i] = (hexToNum(fullHex.charAt(i*2)) << 4) | hexToNum(fullHex.charAt(i*2+1));
-    }
-    // 反转字节顺序
-    data = ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[1] << 8) | bytes[0];
-  }
-  // 模式3: 全24位反转
-  else if (encodeMode == 3) {
-    for (int i = 0; i < 8; i++) {
-      char c = fullHex.charAt(i);
-      uint8_t val = hexToNum(c);
-      data = (data << 4) | val;
-    }
-    data = reverseBits24(data);
-  }
-  // 模式4: LSB优先（从低位到高位）
-  else if (encodeMode == 4) {
-    for (int i = 7; i >= 0; i--) {
-      char c = fullHex.charAt(i);
-      uint8_t val = hexToNum(c);
-      data = (data << 4) | val;
-    }
-  }
-  
-  return data & 0xFFFFFF;  // 只保留24位
-}
-
-// 发送单个位（支持信号反转）
-void sendBit(bool bit, int timing) {
-  bool high = invertSignal ? LOW : HIGH;
-  bool low = invertSignal ? HIGH : LOW;
-  
-  if (bit) {
-    digitalWrite(TX_PIN, high);
-    delayMicroseconds(timing * 3);
-    digitalWrite(TX_PIN, low);
-    delayMicroseconds(timing);
+// 保存信号到闪存
+void saveSignalToFlash() {
+  preferences.begin(PREF_NAMESPACE, false);  // false表示读写模式
+  if (signalCaptured && capturedSignal.address.length() > 0) {
+    preferences.putString(PREF_KEY_ADDRESS, capturedSignal.address);
+    preferences.putString(PREF_KEY_KEY, capturedSignal.key);
+    preferences.putBool(PREF_KEY_CAPTURED, true);
+    Serial.println("[FLASH] 信号已保存到闪存");
   } else {
-    digitalWrite(TX_PIN, high);
-    delayMicroseconds(timing);
-    digitalWrite(TX_PIN, low);
-    delayMicroseconds(timing * 3);
+    // 清空闪存
+    preferences.remove(PREF_KEY_ADDRESS);
+    preferences.remove(PREF_KEY_KEY);
+    preferences.putBool(PREF_KEY_CAPTURED, false);
+    Serial.println("[FLASH] 闪存已清空");
   }
+  preferences.end();
 }
 
-// 发送完整信号（支持可变时序和RCSwitch库）
-void sendSignal(String address, String key, int timing) {
-#ifdef USE_RCSWITCH
-  // 使用RCSwitch库发送（更可靠）
-  if (SEND_MODE == 1) {
-    // RCSwitch方式：将地址码和按键值转换为数据
-    // 注意：62E7E831是32位（4字节），但1527编码是24位
-    // 需要按照1527编码格式：19位地址码 + 5位按键值 = 24位
-    String fullHex = address + key;
+// 从闪存加载信号
+void loadSignalFromFlash() {
+  preferences.begin(PREF_NAMESPACE, true);  // true表示只读模式
+  bool saved = preferences.getBool(PREF_KEY_CAPTURED, false);
+  if (saved) {
+    capturedSignal.address = preferences.getString(PREF_KEY_ADDRESS, "");
+    capturedSignal.key = preferences.getString(PREF_KEY_KEY, "");
+    if (capturedSignal.address.length() > 0 && capturedSignal.key.length() > 0) {
+      signalCaptured = true;
+      currentLEDState = LED_ON;  // 已加载信号，LED常亮
+      Serial.printf("[FLASH] 从闪存加载信号: %s%s\n", 
+                   capturedSignal.address.c_str(), capturedSignal.key.c_str());
+    } else {
+      signalCaptured = false;
+      Serial.println("[FLASH] 闪存中的信号数据无效");
+    }
+  } else {
+    signalCaptured = false;
+    Serial.println("[FLASH] 闪存中没有保存的信号");
+  }
+  preferences.end();
+}
+
+// 接收回调函数
+void onReceive(RFSignal signal) {
+  receiveCount++;
+  Serial.printf("[RECV] 第%lu次接收: %s%s\n", receiveCount, signal.address.c_str(), signal.key.c_str());
+  
+  // 保存接收到的信号到复刻缓冲区
+  lastReceived = signal;
+  replayBuffer[replayBufferIndex] = signal;
+  replayBufferIndex = (replayBufferIndex + 1) % REPLAY_BUFFER_SIZE;
+  if (replayBufferCount < REPLAY_BUFFER_SIZE) {
+    replayBufferCount++;
+  }
+  
+  // 如果处于复刻模式，保存捕获的信号（包括完整的地址码和按键值）
+  if (replayMode) {
+    capturedSignal = signal;  // 保存完整的信号（地址码+按键值）
+    signalCaptured = true;
+    replayMode = false;  // 捕获完成后退出复刻模式
+    currentLEDState = LED_ON;  // 完成复刻，LED常亮
     
-    // 解析为32位数据
+    // 保存到闪存
+    saveSignalToFlash();
+    
+    // 计算实际发送的24位数据（前24位，去掉最后8位）
+    String fullHex = capturedSignal.address + capturedSignal.key;
     uint32_t fullData = 0;
-    for (int i = 0; i < 8; i++) {
-      uint8_t val = hexToNum(fullHex.charAt(i));
+    for (int i = 0; i < 8 && i < fullHex.length(); i++) {
+      char c = fullHex.charAt(i);
+      uint8_t val = 0;
+      if (c >= '0' && c <= '9') val = c - '0';
+      else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+      else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
       fullData = (fullData << 4) | val;
     }
+    uint32_t code24bit = (fullData >> 8) & 0xFFFFFF;  // 前24位（去掉最后8位）
     
-    // 1527编码：提取24位数据（高19位地址码 + 低5位按键值）
-    // 方法1：直接使用后24位（如果接收模块期望这种格式）
-    uint32_t code24bit = fullData & 0xFFFFFF;  // 后24位：E7E831
-    
-    // 方法2：按照1527编码格式（19位地址 + 5位按键）
-    // 从fullData提取：高19位作为地址码，按键值的低5位
-    uint32_t address19bit = (fullData >> 5) & 0x7FFFF;  // 高19位地址码
-    uint8_t key5bit = fullData & 0x1F;  // 低5位按键值
-    uint32_t code1527 = (address19bit << 5) | key5bit;  // 1527格式：24位
-    
-    Serial.printf("[SEND] RCSwitch发送 - 原始:0x%08lX, 24位:0x%06lX, 1527格式:0x%06lX\n", 
-                  fullData, code24bit, code1527);
-    Serial.printf("[SEND] 地址:%s, 按键:%s (19位地址:0x%05lX, 5位按键:0x%02X)\n", 
-                  address.c_str(), key.c_str(), address19bit, key5bit);
-    
-    // 尝试两种方式：先使用后24位方式（与接收到的E7E83100前6位匹配）
-    // 如果不行，可以尝试code1527
-    mySwitch.send(code24bit, 24);
-    Serial.printf("[SEND] 已发送24位数据: 0x%06lX (重复发送5次)\n", code24bit);
-    return;
+    Serial.printf("[REPLAY] ✓ 信号已捕获: %s%s (地址码:%s, 按键值:%s)\n", 
+                 capturedSignal.address.c_str(), capturedSignal.key.c_str(),
+                 capturedSignal.address.c_str(), capturedSignal.key.c_str());
+    Serial.printf("[REPLAY] 实际将发送: 32位=0x%08lX, 24位=0x%06lX\n", fullData, code24bit);
+    Serial.printf("[REPLAY] 现在可以按下GPIO%d按钮发送复刻信号\n", REPLAY_BUTTON_PIN);
+    Serial.printf("[REPLAY] 提示：复刻时将发送完整的8位数据 %s%s（24位编码）\n",
+                 capturedSignal.address.c_str(), capturedSignal.key.c_str());
   }
-#endif
   
-  // GPIO方式：手动编码发送
-  uint32_t data = hexTo24bit(address, key);
-  bool high = invertSignal ? LOW : HIGH;
-  bool low = invertSignal ? HIGH : LOW;
-  
-  Serial.printf("[SEND] GPIO发送 - 编码模式:%d, 数据:0x%06lX\n", encodeMode, data & 0xFFFFFF);
-  
-  // 发送同步码
-  digitalWrite(TX_PIN, high);
-  delayMicroseconds(timing * 31);
-  digitalWrite(TX_PIN, low);
-  delayMicroseconds(timing);
-  
-  // 发送24位数据 - 根据编码模式选择发送顺序
-  if (encodeMode == 4) {
-    // LSB优先：从低位到高位
-    for (int i = 0; i < 24; i++) {
-      bool bit = (data >> i) & 0x01;
-      sendBit(bit, timing);
+  // 如果有发送记录，进行验证
+  if (currentSent.address.length() > 0) {
+    // 计算发送的实际24位数据（RCSwitch发送的是前24位，去掉最后8位）
+    String fullHex = currentSent.address + currentSent.key;
+    uint32_t sentFullData = 0;
+    for (int i = 0; i < 8 && i < fullHex.length(); i++) {
+      char c = fullHex.charAt(i);
+      uint8_t val = 0;
+      if (c >= '0' && c <= '9') val = c - '0';
+      else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+      else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+      sentFullData = (sentFullData << 4) | val;
     }
-  } else {
-    // MSB优先：从高位到低位（默认）
-    for (int i = 23; i >= 0; i--) {
-      bool bit = (data >> i) & 0x01;
-      sendBit(bit, timing);
+    uint32_t sent24bit = (sentFullData >> 8) & 0xFFFFFF;  // 前24位（去掉最后8位）
+    
+    // 将接收到的地址码转换为数值
+    uint32_t recvAddress = 0;
+    for (int i = 0; i < signal.address.length() && i < 6; i++) {
+      char c = signal.address.charAt(i);
+      uint8_t val = 0;
+      if (c >= '0' && c <= '9') val = c - '0';
+      else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+      else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+      recvAddress = (recvAddress << 4) | val;
     }
-  }
-  
-  // 结束
-  digitalWrite(TX_PIN, low);
-  delayMicroseconds(10000);
-}
-
-// 解析接收信号
-bool parseSignal(String data, String &address, String &key) {
-  data.trim();
-  Serial.printf("[PARSE] 尝试解析: '%s' (长度:%d)\n", data.c_str(), data.length());
-  
-  // 格式1: LC:XXXXXXYY
-  if (data.startsWith("LC:") && data.length() >= 11) {
-    String signal = data.substring(3, 11);
-    address = signal.substring(0, 6);
-    key = signal.substring(6, 8);
-    address.toUpperCase();
-    key.toUpperCase();
-    Serial.printf("[PARSE] LC格式解析成功: %s + %s\n", address.c_str(), key.c_str());
-    return true;
-  }
-  
-  // 格式2: RX:XXXXXXYY
-  if (data.startsWith("RX:") && data.length() >= 11) {
-    String signal = data.substring(3, 11);
-    address = signal.substring(0, 6);
-    key = signal.substring(6, 8);
-    address.toUpperCase();
-    key.toUpperCase();
-    Serial.printf("[PARSE] RX格式解析成功: %s + %s\n", address.c_str(), key.c_str());
-    return true;
-  }
-  
-  // 格式3: 直接8位十六进制
-  if (data.length() >= 8) {
-    bool isHex = true;
-    for (int i = 0; i < 8; i++) {
-      char c = data.charAt(i);
-      if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
-        isHex = false;
-        break;
-      }
-    }
-    if (isHex) {
-      address = data.substring(0, 6);
-      key = data.substring(6, 8);
-      address.toUpperCase();
-      key.toUpperCase();
-      Serial.printf("[PARSE] 直接十六进制解析成功: %s + %s\n", address.c_str(), key.c_str());
-      return true;
-    }
-  }
-  
-  Serial.printf("[PARSE] 所有格式解析失败\n");
-  return false;
-}
-
-// 发送任务 - 随机发送10个地址码
-void sendTask(void *parameter) {
-  while (true) {
-    sendCount++;
     
-    // 随机选择一个信号
-    int randomIndex = random(0, RANDOM_SIGNAL_COUNT);
-    RandomSignal selected = randomSignals[randomIndex];
+    // 验证：只比较地址码（前6位），忽略按键值
+    char sentHex[7];
+    sprintf(sentHex, "%06lX", sent24bit);
+    bool matchAddress = (signal.address == String(sentHex));
     
-    // 保存当前发送的信号，用于验证
-    currentSentAddress = selected.address;
-    currentSentKey = selected.key;
-    
-    Serial.printf("\n[SEND] 第%d次发送 [%s]: %s%s\n", 
-                  sendCount, selected.name.c_str(), 
-                  selected.address.c_str(), selected.key.c_str());
-    
-#ifdef USE_RCSWITCH
-    if (SEND_MODE == 1) {
-      Serial.printf("[SEND] 使用RCSwitch库发送（自动重复5次）\n");
-      sendSignal(selected.address, selected.key, 380);
+    if (matchAddress) {
+      testPassed = true;
+      Serial.printf("[TEST] ✓ 验证通过！地址码匹配\n");
+      Serial.printf("[TEST]   期望地址码:%s (24位:0x%06lX), 接收地址码:%s (按键:%s)\n", 
+                  sentHex, sent24bit, signal.address.c_str(), signal.key.c_str());
     } else {
-      Serial.printf("[SEND] 使用GPIO方式发送（固定参数: 380μs + 信号反转）\n");
-      uint32_t testData = hexTo24bit(selected.address, selected.key);
-      Serial.printf("[SEND] 编码数据: 0x%08lX (24位: 0x%06lX)\n", testData, testData & 0xFFFFFF);
-      
-      // GPIO方式：重复发送3次
-      for (int i = 0; i < 3; i++) {
-        Serial.printf("[SEND] 重复 %d/3\n", i+1);
-        sendSignal(selected.address, selected.key, 380);
-        delay(100);
-      }
+      Serial.printf("[TEST] ✗ 验证失败！\n");
+      Serial.printf("[TEST]   期望地址码:%s (24位:0x%06lX)\n", 
+                  sentHex, sent24bit);
+      Serial.printf("[TEST]   接收地址码:%s (按键:%s, 地址码:0x%06lX)\n", 
+                  signal.address.c_str(), signal.key.c_str(), recvAddress);
     }
-#else
-    Serial.printf("[SEND] 使用GPIO方式发送（固定参数: 380μs + 信号反转）\n");
-    uint32_t testData = hexTo24bit(selected.address, selected.key);
-    Serial.printf("[SEND] 编码数据: 0x%08lX (24位: 0x%06lX)\n", testData, testData & 0xFFFFFF);
-    
-    // GPIO方式：重复发送3次
-    for (int i = 0; i < 3; i++) {
-      Serial.printf("[SEND] 重复 %d/3\n", i+1);
-      sendSignal(selected.address, selected.key, 380);
-      delay(100);
-    }
-#endif
-    
-    vTaskDelay(pdMS_TO_TICKS(SEND_INTERVAL));
   }
 }
 
 // 接收任务
 void receiveTask(void *parameter) {
-  String buffer = "";
-  unsigned long lastDebugTime = 0;
-  int totalBytes = 0;
-  
   while (true) {
-    // 每5秒输出调试信息
-    if (millis() - lastDebugTime > 5000) {
-      Serial.printf("[DEBUG] 串口状态 - 总接收字节:%d, 缓冲区长度:%d\n", totalBytes, buffer.length());
-      Serial.printf("[DEBUG] Serial1可用字节: %d\n", Serial1.available());
-      lastDebugTime = millis();
-    }
-    
-    if (Serial1.available()) {
-      char c = Serial1.read();
-      totalBytes++;
-      
-      // 输出原始字节（十六进制和字符）
-      Serial.printf("[RAW] 0x%02X ('%c')\n", (uint8_t)c, (c >= 32 && c <= 126) ? c : '.');
-      
-      if (c == '\n' || c == '\r') {
-        if (buffer.length() > 0) {
-          Serial.printf("[RECV] 完整数据: '%s' (长度:%d)\n", buffer.c_str(), buffer.length());
-          
-          String address, key;
-          if (parseSignal(buffer, address, key)) {
-            receiveCount++;
-            Serial.printf("[RECV] 第%d次接收: %s%s\n", receiveCount, address.c_str(), key.c_str());
-            
-            // 验证是否匹配（与当前发送的随机信号比较）
-            if (currentSentAddress.length() == 0) {
-              Serial.println("[TEST] 警告：当前没有发送信号记录，无法验证");
-            } else {
-              // 计算发送的实际24位数据（RCSwitch发送的是后24位）
-              String fullHex = currentSentAddress + currentSentKey;
-              uint32_t sentFullData = 0;
-              for (int i = 0; i < 8 && i < fullHex.length(); i++) {
-                uint8_t val = hexToNum(fullHex.charAt(i));
-                sentFullData = (sentFullData << 4) | val;
-              }
-              uint32_t sent24bit = sentFullData & 0xFFFFFF;  // 后24位
-              
-              // 将接收到的地址码转换为数值
-              uint32_t recvAddress = 0;
-              for (int i = 0; i < address.length() && i < 6; i++) {
-                uint8_t val = hexToNum(address.charAt(i));
-                recvAddress = (recvAddress << 4) | val;
-              }
-              
-              // 验证方式1：完全匹配（地址码+按键值）
-              bool matchFull = (address == currentSentAddress && key == currentSentKey);
-              
-              // 验证方式2：24位数据匹配（接收到的地址码匹配发送的24位数据）
-              bool match24bit = (recvAddress == sent24bit);
-              
-              // 验证方式3：接收到的地址码是发送24位数据的后6位十六进制
-              char sentHex[7];
-              sprintf(sentHex, "%06lX", sent24bit);
-              bool matchHex = (address == String(sentHex));
-              
-              if (matchFull) {
-                testPassed = true;
-                Serial.printf("[TEST] ✓ 验证通过！完全匹配（期望:%s%s, 接收:%s%s）\n", 
-                            currentSentAddress.c_str(), currentSentKey.c_str(),
-                            address.c_str(), key.c_str());
-              } else if (match24bit || matchHex) {
-                testPassed = true;
-                Serial.printf("[TEST] ✓ 验证通过！24位数据匹配\n");
-                Serial.printf("[TEST]   期望:%s%s (24位:0x%06lX), 接收:%s%s\n", 
-                            currentSentAddress.c_str(), currentSentKey.c_str(),
-                            sent24bit, address.c_str(), key.c_str());
-              } else {
-                Serial.printf("[TEST] ✗ 验证失败！\n");
-                Serial.printf("[TEST]   期望:%s%s (24位:0x%06lX %s)\n", 
-                            currentSentAddress.c_str(), currentSentKey.c_str(),
-                            sent24bit, sentHex);
-                Serial.printf("[TEST]   接收:%s%s (地址码:0x%06lX)\n", 
-                            address.c_str(), key.c_str(), recvAddress);
-              }
-            }
-          } else {
-            Serial.printf("[PARSE] 解析失败: '%s'\n", buffer.c_str());
-          }
-          
-          buffer = "";
-        }
-      } else {
-        buffer += c;
-        if (buffer.length() > 64) {
-          Serial.printf("[WARN] 缓冲区溢出，清空: '%s'\n", buffer.c_str());
-          buffer = "";
-        }
+    // 检查接收（回调函数会自动处理）
+    if (rf.receiveAvailable()) {
+      RFSignal signal;
+      if (rf.receive(signal)) {
+        // 回调函数已经处理了验证逻辑
       }
     }
     
@@ -443,10 +198,156 @@ void receiveTask(void *parameter) {
 // 状态监控任务
 void statusTask(void *parameter) {
   while (true) {
-    Serial.printf("[STATUS] 发送:%d次, 接收:%d次, 测试:%s\n", 
+    Serial.printf("[STATUS] 发送:%lu次, 接收:%lu次, 测试:%s\n", 
                   sendCount, receiveCount, testPassed ? "通过" : "进行中");
-    
     vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
+
+// LED控制任务 - 根据复刻状态控制LED（反向逻辑）
+void ledTask(void *parameter) {
+  unsigned long lastBlinkTime = 0;
+  bool ledBlinkState = false;
+  const unsigned long blinkInterval = 200;  // 快闪间隔200ms
+  
+  while (true) {
+    switch (currentLEDState) {
+      case LED_OFF:
+        digitalWrite(LED_PIN, HIGH);  // 熄灭（反向：HIGH熄灭）
+        break;
+        
+      case LED_BLINK:
+        // 快闪：每200ms切换一次（反向逻辑）
+        if (millis() - lastBlinkTime >= blinkInterval) {
+          ledBlinkState = !ledBlinkState;
+          digitalWrite(LED_PIN, ledBlinkState ? LOW : HIGH);  // 反向：LOW亮，HIGH灭
+          lastBlinkTime = millis();
+        }
+        break;
+        
+      case LED_ON:
+        digitalWrite(LED_PIN, LOW);  // 常亮（反向：LOW常亮）
+        break;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(10));  // 10ms更新间隔
+  }
+}
+
+// GPIO按钮检测任务 - 检测复刻按钮按下（支持短按和长按）
+void buttonTask(void *parameter) {
+  bool lastStableState = HIGH;
+  bool currentReading = HIGH;
+  bool lastReading = HIGH;
+  unsigned long lastDebounceTime = 0;
+  const unsigned long debounceDelay = 50;  // 防抖延迟50ms
+  unsigned long buttonPressStartTime = 0;
+  const unsigned long longPressDuration = 2000;  // 长按时间2秒
+  bool buttonPressed = false;  // 防止重复触发
+  bool longPressTriggered = false;  // 长按已触发标志
+  
+  while (true) {
+    currentReading = digitalRead(REPLAY_BUTTON_PIN);
+    
+    // 检测状态变化
+    if (currentReading != lastReading) {
+      // 状态发生变化，重置防抖计时器
+      lastDebounceTime = millis();
+    }
+    
+    // 如果状态稳定超过防抖时间
+    if ((millis() - lastDebounceTime) > debounceDelay) {
+      // 状态已稳定
+      if (currentReading != lastStableState) {
+        // 稳定状态发生变化
+        if (currentReading == LOW && lastStableState == HIGH) {
+          // 从HIGH稳定变为LOW（按下）
+          if (!buttonPressed) {
+            buttonPressed = true;
+            buttonPressStartTime = millis();
+            longPressTriggered = false;
+            Serial.printf("\n[BUTTON] ✓ 检测到按钮按下（GPIO%d）\n", REPLAY_BUTTON_PIN);
+          }
+        } else if (currentReading == HIGH && lastStableState == LOW) {
+          // 从LOW稳定变为HIGH（释放）
+          if (buttonPressed) {
+            unsigned long pressDuration = millis() - buttonPressStartTime;
+            
+            if (!longPressTriggered && pressDuration < longPressDuration) {
+              // 短按：发送复刻信号
+              Serial.printf("[BUTTON] 短按检测（%lums）：发送复刻信号\n", pressDuration);
+              
+              if (signalCaptured) {
+                currentSent = capturedSignal;  // 记录发送的信号用于验证
+                Serial.printf("[REPLAY] 发送复刻信号: %s%s\n", 
+                             capturedSignal.address.c_str(), capturedSignal.key.c_str());
+                Serial.printf("[REPLAY] 地址码: %s, 按键值: %s\n",
+                             capturedSignal.address.c_str(), capturedSignal.key.c_str());
+                
+                // 计算实际发送的24位数据（前24位，去掉最后8位）
+                String fullHex = capturedSignal.address + capturedSignal.key;
+                uint32_t fullData = 0;
+                for (int i = 0; i < 8 && i < fullHex.length(); i++) {
+                  char c = fullHex.charAt(i);
+                  uint8_t val = 0;
+                  if (c >= '0' && c <= '9') val = c - '0';
+                  else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+                  else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+                  fullData = (fullData << 4) | val;
+                }
+                uint32_t code24bit = (fullData >> 8) & 0xFFFFFF;  // 前24位（去掉最后8位）
+                Serial.printf("[REPLAY] 实际发送: 32位=0x%08lX, 24位=0x%06lX\n", fullData, code24bit);
+                
+                rf.send(capturedSignal);  // 发送完整信号（地址码+按键值）
+                sendCount++;
+              } else {
+                Serial.println("[REPLAY] 警告：没有捕获的信号，请先使用 'capture' 命令");
+                Serial.println("[REPLAY] 提示：可以使用 'test' 命令测试发送功能");
+              }
+            } else if (longPressTriggered) {
+              Serial.println("[BUTTON] 长按释放：复刻信号已清空");
+            }
+            
+            buttonPressed = false;
+            Serial.printf("[BUTTON] 按钮释放（GPIO%d断开）\n", REPLAY_BUTTON_PIN);
+          }
+        }
+        lastStableState = currentReading;
+      }
+      
+      // 持续检测长按（按钮持续按下时）
+      if (buttonPressed && currentReading == LOW && !longPressTriggered) {
+        unsigned long pressDuration = millis() - buttonPressStartTime;
+        
+        // 检测长按（按下超过2秒）- 立即清空，不等待释放
+        if (pressDuration >= longPressDuration) {
+          longPressTriggered = true;
+          Serial.println("[BUTTON] 长按检测（2秒）：立即清空复刻信号");
+          
+          // 立即清空复刻信号
+          signalCaptured = false;
+          capturedSignal = {"", ""};
+          replayMode = true;  // 清空后自动进入复刻模式
+          currentLEDState = LED_BLINK;  // LED快闪，等待接收信号
+          
+          // 清空闪存
+          saveSignalToFlash();
+          
+          Serial.println("[REPLAY] 复刻信号已清空（内存+闪存），自动进入复刻模式");
+        } else {
+          // 显示长按倒计时（可选，每500ms显示一次）
+          static unsigned long lastProgressTime = 0;
+          if (millis() - lastProgressTime >= 500) {
+            unsigned long remaining = longPressDuration - pressDuration;
+            Serial.printf("[BUTTON] 长按中... 还需按住 %lums 才能清空\n", remaining);
+            lastProgressTime = millis();
+          }
+        }
+      }
+    }
+    
+    lastReading = currentReading;
+    vTaskDelay(pdMS_TO_TICKS(10));  // 10ms检测间隔
   }
 }
 
@@ -455,79 +356,103 @@ void setup() {
   delay(2000);
   
   Serial.println("========================================");
-  Serial.println("ESP32 433MHz 收发测试 (RTOS版本)");
+  Serial.println("ESP32 433MHz 收发测试 (使用ESP433RF库)");
   Serial.println("========================================");
   
-  // 初始化硬件
-  pinMode(TX_PIN, OUTPUT);
-  digitalWrite(TX_PIN, LOW);
-  Serial1.begin(9600, SERIAL_8N1, RX_PIN, -1);
+  // 初始化ESP433RF库（仅支持RCSwitch模式）
+  rf.begin();
   
-#ifdef USE_RCSWITCH
-  // 初始化RCSwitch库
-  if (SEND_MODE == 1) {
-    mySwitch.enableTransmit(TX_PIN);
-    mySwitch.setProtocol(1);  // Protocol 1 = EV1527/PT2262兼容
-    mySwitch.setPulseLength(320);  // 脉冲长度320μs（与当前时序匹配）
-    mySwitch.setRepeatTransmit(5);  // 重复发送5次（提高接收成功率）
-    Serial.println("RCSwitch库已初始化");
-    Serial.printf("  协议: Protocol 1 (EV1527/PT2262)\n");
-    Serial.printf("  脉冲长度: 320μs\n");
-    Serial.printf("  重复次数: 5次\n");
-  }
-#endif
+  // 配置库参数
+  rf.setRepeatCount(5);     // 重复5次
+  rf.setProtocol(1);        // Protocol 1 (EV1527/PT2262)
+  rf.setPulseLength(320);  // 320μs脉冲长度
   
-  Serial.printf("发射引脚: GPIO%d\n", TX_PIN);
+  // 设置接收回调
+  rf.setReceiveCallback(onReceive);
+  
+  Serial.println("ESP433RF库已初始化");
+  Serial.printf("  协议: Protocol 1 (EV1527/PT2262)\n");
+  Serial.printf("  脉冲长度: 320μs\n");
+  Serial.printf("  重复次数: 5次\n");
+  
+  Serial.printf("\n发射引脚: GPIO%d\n", TX_PIN);
   Serial.printf("接收引脚: GPIO%d\n", RX_PIN);
-  Serial.printf("测试模式: 随机发送10个地址码\n");
-  Serial.printf("发送间隔: %d秒\n", SEND_INTERVAL/1000);
-  Serial.println("随机地址码列表:");
-  for (int i = 0; i < RANDOM_SIGNAL_COUNT; i++) {
-    Serial.printf("  [%s] %s%s\n", randomSignals[i].name.c_str(), 
-                  randomSignals[i].address.c_str(), randomSignals[i].key.c_str());
-  }
+  Serial.printf("复刻按钮: GPIO%d (短按发送复刻信号，长按2秒清空信号)\n", REPLAY_BUTTON_PIN);
+  Serial.printf("LED指示灯: GPIO%d\n", LED_PIN);
   
-  // 初始化随机种子
-  randomSeed(analogRead(0));
+  // 初始化复刻按钮GPIO（使用内部上拉电阻，按下时为LOW）
+  pinMode(REPLAY_BUTTON_PIN, INPUT_PULLUP);
+  
+  // 初始化LED引脚（反向逻辑：HIGH熄灭，LOW常亮）
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);  // 启动时默认熄灭（反向：HIGH熄灭）
+  currentLEDState = LED_OFF;
+  
+  // 从闪存加载信号
+  Serial.println("\n[FLASH] 正在从闪存加载信号...");
+  loadSignalFromFlash();
+  
+  // 如果没有复刻信号，自动进入复刻状态
+  if (!signalCaptured) {
+    replayMode = true;
+    signalCaptured = false;
+    capturedSignal = {"", ""};
+    currentLEDState = LED_BLINK;  // 进入复刻模式，LED快闪
+    Serial.println("\n[自动] 检测到没有复刻信号，自动进入复刻模式");
+    Serial.println("[自动] LED指示灯快闪中，等待接收信号...");
+  } else {
+    Serial.println("[自动] 已从闪存恢复复刻信号，LED常亮");
+  }
   
   // 硬件测试
-  Serial.println("========================================");
+  Serial.println("\n========================================");
   Serial.println("硬件测试:");
-  Serial.printf("GPIO%d输出测试: ", TX_PIN);
+  pinMode(TX_PIN, OUTPUT);
   digitalWrite(TX_PIN, HIGH);
   delay(100);
   digitalWrite(TX_PIN, LOW);
-  Serial.println("完成");
+  Serial.println("GPIO14输出测试: 完成");
   
-  Serial.printf("Serial1接收测试: ");
-  Serial1.flush();
-  delay(100);
-  Serial.printf("缓冲区字节数: %d\n", Serial1.available());
+  // 测试复刻按钮
+  bool buttonState = digitalRead(REPLAY_BUTTON_PIN);
+  Serial.printf("GPIO%d按钮状态: %s (当前: %s)\n", 
+               REPLAY_BUTTON_PIN, 
+               buttonState == HIGH ? "未按下(HIGH)" : "按下(LOW)",
+               buttonState == HIGH ? "HIGH" : "LOW");
+  Serial.printf("提示：按下boot按键（GPIO%d）可以发送复刻信号\n", REPLAY_BUTTON_PIN);
   
-  // 串口回环测试（如果有连接）
-  Serial.println("等待接收模块数据...");
-  unsigned long testStart = millis();
-  bool dataReceived = false;
-  while (millis() - testStart < 2000) {
-    if (Serial1.available()) {
-      Serial.printf("检测到数据: 0x%02X\n", Serial1.read());
-      dataReceived = true;
-      break;
-    }
-    delay(10);
-  }
-  if (!dataReceived) {
+  Serial.printf("Serial1接收测试: 缓冲区字节数: %d\n", Serial1.available());
+  delay(2000);
+  if (Serial1.available() > 0) {
+    Serial.println("接收模块检测到数据");
+  } else {
     Serial.println("警告: 2秒内未检测到接收模块数据");
   }
-  
   Serial.println("========================================");
   
   // 创建RTOS任务
-  xTaskCreate(sendTask, "SendTask", 4096, NULL, 2, NULL);
   xTaskCreate(receiveTask, "ReceiveTask", 4096, NULL, 2, NULL);
   xTaskCreate(statusTask, "StatusTask", 2048, NULL, 1, NULL);
+  xTaskCreate(buttonTask, "ButtonTask", 2048, NULL, 2, NULL);  // GPIO按钮检测任务
+  xTaskCreate(ledTask, "LEDTask", 2048, NULL, 1, NULL);  // LED控制任务
   
-  Serial.println("RTOS任务已启动，开始收发测试...");
+  Serial.println("\nRTOS任务已启动，系统就绪");
+  Serial.println("\n复刻功能说明:");
+  Serial.println("  - 系统启动时会自动从闪存加载保存的信号（关机不丢失）");
+  Serial.println("  - 系统启动时如果没有复刻信号，会自动进入复刻模式");
+  Serial.println("  - 使用 'capture' 命令可手动进入复刻模式，然后按下遥控器");
+  Serial.println("  - 捕获信号后会自动保存到闪存，关机后仍可恢复");
+  Serial.printf("  - 捕获信号后，短按boot按键（GPIO%d）发送复刻信号\n", REPLAY_BUTTON_PIN);
+  Serial.printf("  - 长按boot按键（GPIO%d）2秒可清空复刻信号（内存+闪存，自动进入复刻模式）\n", REPLAY_BUTTON_PIN);
+  Serial.println("  - LED指示灯状态（反向逻辑：HIGH熄灭，LOW常亮）：");
+  Serial.println("    * 熄灭（HIGH）：没有复刻信号（自动进入复刻模式）");
+  Serial.println("    * 快闪：复刻模式，等待接收信号");
+  Serial.println("    * 常亮（LOW）：完成复刻，已捕获信号");
+  Serial.println("  - 使用 'replay' 命令复刻最后接收的信号");
+  Serial.println("  - 使用 'list' 命令查看所有保存的信号");
+  Serial.println("  - 使用 'replay:N' 复刻第N个信号");
+  Serial.println("  - 使用 'send:XXXXXXYY' 手动发送信号");
+  Serial.println("  - 使用 'help' 查看所有命令");
 }
 
 void loop() {
@@ -538,41 +463,165 @@ void loop() {
     
     if (cmd == "test") {
       Serial.println("手动发送测试信号...");
+      RFSignal testSignal = {"62E7E8", "31"};
+      currentSent = testSignal;  // 记录发送的信号用于验证
       for (int i = 0; i < 3; i++) {
         Serial.printf("发送 %d/3\n", i+1);
-        sendSignal(TEST_ADDRESS, TEST_KEY, timingTests[currentTimingIndex]);
+        rf.send(testSignal);
         delay(100);
       }
-    } else if (cmd == "flip") {
-      invertSignal = !invertSignal;
-      Serial.printf("信号反转: %s\n", invertSignal ? "是" : "否");
-    } else if (cmd.startsWith("timing:")) {
-      int newTiming = cmd.substring(7).toInt();
-      if (newTiming > 0) {
-        Serial.printf("测试时序 %dμs...\n", newTiming);
+      sendCount++;
+    } else if (cmd == "button" || cmd == "btn") {
+      // 测试按钮功能（模拟按钮按下）
+      Serial.printf("模拟按钮按下（GPIO%d）\n", REPLAY_BUTTON_PIN);
+      bool currentState = digitalRead(REPLAY_BUTTON_PIN);
+      Serial.printf("当前按钮状态: %s\n", currentState == HIGH ? "HIGH(未按下)" : "LOW(按下)");
+      if (signalCaptured) {
+        Serial.printf("发送捕获的信号: %s%s\n", 
+                     capturedSignal.address.c_str(), capturedSignal.key.c_str());
+        currentSent = capturedSignal;
+        rf.send(capturedSignal);
+        sendCount++;
+      } else {
+        Serial.println("提示：没有捕获的信号，使用 'capture' 命令先捕获信号");
+        Serial.println("或者使用 'test' 命令测试发送功能");
+      }
+    } else if (cmd == "capture" || cmd == "c") {
+      // 进入复刻模式，等待接收信号
+      replayMode = true;
+      signalCaptured = false;
+      capturedSignal = {"", ""};
+      currentLEDState = LED_BLINK;  // 进入复刻模式，LED快闪
+      Serial.println("[REPLAY] 已进入复刻模式，请按下遥控器...");
+      Serial.println("[REPLAY] 等待接收信号...");
+      Serial.println("[REPLAY] LED指示灯快闪中...");
+    } else if (cmd == "replay" || cmd == "r") {
+      // 复刻最后接收到的信号
+      if (lastReceived.address.length() > 0) {
+        currentSent = lastReceived;  // 记录发送的信号用于验证
+        Serial.printf("复刻最后接收的信号: %s%s\n", 
+                     lastReceived.address.c_str(), lastReceived.key.c_str());
+        Serial.println("发送3次...");
         for (int i = 0; i < 3; i++) {
-          sendSignal(TEST_ADDRESS, TEST_KEY, newTiming);
+          rf.send(lastReceived);
           delay(100);
         }
+        sendCount++;
+      } else {
+        Serial.println("错误：没有接收到任何信号，无法复刻");
       }
-     } else if (cmd == "status") {
-       Serial.printf("发送:%d次, 接收:%d次, 测试:%s\n", 
-                     sendCount, receiveCount, testPassed ? "通过" : "进行中");
-       Serial.printf("当前时序:%dμs, 信号反转:%s, 编码模式:%d\n", 
-                     timingTests[currentTimingIndex], invertSignal ? "是" : "否", encodeMode);
-     } else if (cmd.startsWith("mode:")) {
-       int newMode = cmd.substring(5).toInt();
-       if (newMode >= 0 && newMode <= 4) {
-         encodeMode = newMode;
-         Serial.printf("编码模式设置为: %d\n", encodeMode);
-         Serial.println("模式说明:");
-         Serial.println("  0=无反转（直接）");
-         Serial.println("  1=半字节反转");
-         Serial.println("  2=字节反转");
-         Serial.println("  3=全24位反转");
-         Serial.println("  4=LSB优先");
-       }
-     }
+    } else if (cmd == "send" || cmd == "s") {
+      // 发送已捕获的信号（通过GPIO按钮或串口命令）
+      if (signalCaptured) {
+        currentSent = capturedSignal;  // 记录发送的信号用于验证
+        Serial.printf("发送捕获的信号: %s%s\n", 
+                     capturedSignal.address.c_str(), capturedSignal.key.c_str());
+        Serial.println("发送3次...");
+        for (int i = 0; i < 3; i++) {
+          rf.send(capturedSignal);
+          delay(100);
+        }
+        sendCount++;
+      } else {
+        Serial.println("错误：没有捕获的信号，请先使用 'capture' 命令");
+      }
+    } else if (cmd == "list" || cmd == "l") {
+      // 列出复刻缓冲区中的所有信号
+      Serial.printf("复刻缓冲区 (%d个信号):\n", replayBufferCount);
+      int startIdx = (replayBufferIndex - replayBufferCount + REPLAY_BUFFER_SIZE) % REPLAY_BUFFER_SIZE;
+      for (int i = 0; i < replayBufferCount; i++) {
+        int idx = (startIdx + i) % REPLAY_BUFFER_SIZE;
+        Serial.printf("  [%d] %s%s\n", i + 1, 
+                     replayBuffer[idx].address.c_str(), 
+                     replayBuffer[idx].key.c_str());
+      }
+    } else if (cmd.startsWith("replay:")) {
+      // 复刻指定索引的信号: replay:1, replay:2, etc.
+      int index = cmd.substring(7).toInt() - 1;
+      if (index >= 0 && index < replayBufferCount) {
+        int startIdx = (replayBufferIndex - replayBufferCount + REPLAY_BUFFER_SIZE) % REPLAY_BUFFER_SIZE;
+        int idx = (startIdx + index) % REPLAY_BUFFER_SIZE;
+        RFSignal signal = replayBuffer[idx];
+        currentSent = signal;  // 记录发送的信号用于验证
+        Serial.printf("复刻信号 [%d]: %s%s\n", index + 1, 
+                     signal.address.c_str(), signal.key.c_str());
+        Serial.println("发送3次...");
+        for (int i = 0; i < 3; i++) {
+          rf.send(signal);
+          delay(100);
+        }
+        sendCount++;
+      } else {
+        Serial.printf("错误：索引 %d 无效（范围: 1-%d）\n", index + 1, replayBufferCount);
+      }
+    } else if (cmd.startsWith("send:")) {
+      // 手动发送指定信号: send:62E7E831
+      String signalStr = cmd.substring(5);
+      signalStr.trim();
+      signalStr.toUpperCase();
+      if (signalStr.length() >= 8) {
+        RFSignal signal;
+        signal.address = signalStr.substring(0, 6);
+        signal.key = signalStr.substring(6, 8);
+        currentSent = signal;  // 记录发送的信号用于验证
+        Serial.printf("发送信号: %s%s\n", signal.address.c_str(), signal.key.c_str());
+        Serial.println("发送3次...");
+        for (int i = 0; i < 3; i++) {
+          rf.send(signal);
+          delay(100);
+        }
+        sendCount++;
+      } else {
+        Serial.println("错误：信号格式错误，应为8位十六进制（如: 62E7E831）");
+      }
+    } else if (cmd == "status") {
+      Serial.printf("发送:%lu次, 接收:%lu次, 测试:%s\n", 
+                    rf.getSendCount(), rf.getReceiveCount(), 
+                    testPassed ? "通过" : "进行中");
+      Serial.printf("复刻缓冲区: %d个信号\n", replayBufferCount);
+      if (lastReceived.address.length() > 0) {
+        Serial.printf("最后接收: %s%s\n", 
+                     lastReceived.address.c_str(), lastReceived.key.c_str());
+      }
+      if (signalCaptured) {
+        Serial.printf("已捕获信号: %s%s (可通过GPIO%d按钮或'send'命令发送)\n", 
+                     capturedSignal.address.c_str(), capturedSignal.key.c_str(), REPLAY_BUTTON_PIN);
+      } else {
+        Serial.println("未捕获信号（使用 'capture' 命令进入复刻模式）");
+      }
+      Serial.printf("复刻模式: %s\n", replayMode ? "等待接收信号..." : "未激活");
+    } else if (cmd == "reset") {
+      rf.resetCounters();
+      sendCount = 0;
+      receiveCount = 0;
+      testPassed = false;
+      replayBufferCount = 0;
+      replayBufferIndex = 0;
+      lastReceived = {"", ""};
+      replayMode = true;  // 重置后自动进入复刻模式
+      signalCaptured = false;
+      capturedSignal = {"", ""};
+      currentLEDState = LED_BLINK;  // LED快闪，等待接收信号
+      
+      // 清空闪存
+      saveSignalToFlash();
+      
+      Serial.println("计数器已重置，自动进入复刻模式（LED快闪）");
+    } else if (cmd == "help" || cmd == "h") {
+      Serial.println("可用命令:");
+      Serial.println("  capture / c   - 进入复刻模式，等待接收信号（LED快闪）");
+      Serial.printf("  send / s      - 发送已捕获的信号（或短按boot按键GPIO%d）\n", REPLAY_BUTTON_PIN);
+      Serial.printf("  长按boot按键（GPIO%d）2秒 - 清空复刻信号（自动进入复刻模式）\n", REPLAY_BUTTON_PIN);
+      Serial.printf("  button / btn  - 测试按钮功能（模拟按钮按下）\n");
+      Serial.println("  replay / r    - 复刻最后接收的信号");
+      Serial.println("  list / l      - 列出复刻缓冲区中的所有信号");
+      Serial.println("  replay:N      - 复刻第N个信号（如: replay:1）");
+      Serial.println("  send:XXXXXXYY - 发送指定信号（如: send:62E7E831）");
+      Serial.println("  test          - 发送测试信号");
+      Serial.println("  status        - 显示状态");
+      Serial.println("  reset         - 重置计数器");
+      Serial.println("  help / h      - 显示帮助");
+    }
   }
   
   delay(100);
