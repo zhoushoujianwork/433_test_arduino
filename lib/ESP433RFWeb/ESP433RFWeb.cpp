@@ -277,6 +277,18 @@ void ESP433RFWeb::handleRoot() {
         <div style="display:flex;gap:10px;margin-bottom:16px;">
             <button class="btn" style="flex:1;background:linear-gradient(135deg,#f093fb 0%,#f5576c 100%);" onclick="clearAll()">🗑️ 清空所有</button>
         </div>
+        
+        <div class="card" style="background:linear-gradient(135deg,#fff5f5 0%,#ffe5e5 100%);border-left:4px solid #f5576c;">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+                <span style="font-size:24px;">⚠️</span>
+                <h3 style="margin:0;color:#d63031;">使用提示</h3>
+            </div>
+            <div style="font-size:13px;line-height:1.6;color:#666;">
+                <p style="margin:5px 0;"><strong>✅ 允许：</strong>备份自己的遥控器、控制自己的设备</p>
+                <p style="margin:5px 0;"><strong>❌ 禁止：</strong>复制他人门禁、未授权访问、非法用途</p>
+                <p style="margin:5px 0;color:#d63031;"><strong>⚖️ 责任：</strong>使用者需遵守法律法规，对使用后果自行负责</p>
+            </div>
+        </div>
          
         <div class="card">
             <h2>快捷操作</h2>

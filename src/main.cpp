@@ -501,7 +501,21 @@ void setup() {
   xTaskCreate(ledTask, "LEDTask", 2048, NULL, 1, NULL);  // LED控制任务
   
   Serial.println("\nRTOS任务已启动，系统就绪");
-  Serial.println("\n复刻功能说明:");
+  
+  // 使用声明
+  Serial.println("\n==================================================");
+  Serial.println("⚠️  重要提示 - 请务必阅读");
+  Serial.println("==================================================");
+  Serial.println("本设备仅供学习、研究和个人合法使用");
+  Serial.println("");
+  Serial.println("✅ 允许：备份自己的遥控器、控制自己的设备");
+  Serial.println("❌ 禁止：复制他人门禁、未授权访问、非法用途");
+  Serial.println("");
+  Serial.println("使用者需遵守当地法律法规和无线电管理规定");
+  Serial.println("对使用本设备造成的后果自行承担全部法律责任");
+  Serial.println("==================================================\n");
+  
+  Serial.println("复刻功能说明:");
   Serial.println("  - 系统启动时会自动从闪存加载保存的信号（关机不丢失）");
   Serial.printf("  - 短按boot按键（GPIO%d）发送绑定的信号\n", REPLAY_BUTTON_PIN);
   Serial.printf("  - 长按boot按键（GPIO%d）2秒可清空复刻信号\n", REPLAY_BUTTON_PIN);
