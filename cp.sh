@@ -1,0 +1,1 @@
+cp .pio/build/esp32-s3-devkitc-1/firmware.bin release/ESP32-S3-433MHz-v2.0.0.bin
