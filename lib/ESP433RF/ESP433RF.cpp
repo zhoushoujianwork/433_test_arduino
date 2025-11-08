@@ -32,6 +32,9 @@ ESP433RF::ESP433RF(uint8_t txPin, uint8_t rxPin, uint32_t baudRate) {
   _capturedSignal = {"", ""};
   _hasCapturedSignal = false;
   
+  // Initialize receive control
+  _receiveEnabled = true;
+  
   // Initialize flash storage
   #ifdef ESP32
   _flashStorageEnabled = false;
@@ -78,6 +81,14 @@ bool ESP433RF::receiveAvailable() {
 // Receive signal
 bool ESP433RF::receive(RFSignal &signal) {
   static String buffer = "";
+  
+  // 如果接收被禁用，清空缓冲区并返回false
+  if (!_receiveEnabled) {
+    while (_serial->available()) {
+      _serial->read();  // 丢弃数据
+    }
+    return false;
+  }
   
   while (_serial->available()) {
     char c = _serial->read();
@@ -450,3 +461,18 @@ void ESP433RF::clearFlash() {
   _preferences->end();
 }
 #endif
+
+// Receive control functions
+void ESP433RF::enableReceive() {
+  _receiveEnabled = true;
+  Serial.println("[ESP433RF] 接收已启用");
+}
+
+void ESP433RF::disableReceive() {
+  _receiveEnabled = false;
+  Serial.println("[ESP433RF] 接收已禁用");
+}
+
+bool ESP433RF::isReceiving() {
+  return _receiveEnabled;
+}

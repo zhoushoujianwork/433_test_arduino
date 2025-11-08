@@ -84,6 +84,11 @@ public:
   RFSignal getCapturedSignal();  // 获取捕获的信号
   void clearCapturedSignal();  // 清空捕获的信号
   
+  // Receive control functions (接收控制)
+  void enableReceive();  // 启用接收
+  void disableReceive();  // 禁用接收
+  bool isReceiving();  // 是否正在接收
+  
   // Flash persistence functions (闪存持久化，仅ESP32)
   #ifdef ESP32
   void enableFlashStorage(const char* namespace_name = "rf_replay");  // 启用闪存存储
@@ -129,6 +134,9 @@ private:
   bool _captureMode;
   RFSignal _capturedSignal;
   bool _hasCapturedSignal;
+  
+  // Receive control
+  bool _receiveEnabled;
   
   // Flash storage (ESP32 only)
   #ifdef ESP32

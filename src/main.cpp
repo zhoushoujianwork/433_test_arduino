@@ -3,6 +3,8 @@
 #define USE_RCSWITCH 1
 #include <ESP433RF.h>
 #include <Preferences.h>  // ESP32闪存存储库
+#include <SignalManager.h>  // 信号管理库
+#include <ESP433RFWeb.h>    // Web管理界面库
 
 // 硬件引脚定义
 #define TX_PIN 14       // 发射模块DATA引脚
@@ -41,7 +43,13 @@ static bool testPassed = false;
 // 创建ESP433RF实例
 ESP433RF rf(TX_PIN, RX_PIN, 9600);
 
-// 闪存存储实例
+// 创建信号管理器实例（最多50个信号）
+SignalManager signalManager(50);
+
+// 创建Web管理界面实例
+ESP433RFWeb webManager(rf, signalManager);
+
+// 闪存存储实例（保留用于向后兼容）
 Preferences preferences;
 const char* PREF_NAMESPACE = "rf_replay";  // 命名空间
 const char* PREF_KEY_ADDRESS = "address";  // 地址码键
@@ -94,7 +102,7 @@ void onReceive(RFSignal signal) {
   receiveCount++;
   Serial.printf("[RECV] 第%lu次接收: %s%s\n", receiveCount, signal.address.c_str(), signal.key.c_str());
   
-  // 保存接收到的信号到复刻缓冲区
+  // 保存接收到的信号到复刻缓冲区（向后兼容）
   lastReceived = signal;
   replayBuffer[replayBufferIndex] = signal;
   replayBufferIndex = (replayBufferIndex + 1) % REPLAY_BUFFER_SIZE;
@@ -102,14 +110,41 @@ void onReceive(RFSignal signal) {
     replayBufferCount++;
   }
   
-  // 如果处于复刻模式，保存捕获的信号（包括完整的地址码和按键值）
-  if (replayMode) {
+  // 只在捕获模式下添加到信号管理器
+  if (replayMode || rf.isCaptureMode()) {
+    // 去重：检查是否已存在相同的信号
+    bool isDuplicate = false;
+    uint8_t count = signalManager.getCount();
+    SignalItem item;
+    for (uint8_t i = 0; i < count; i++) {
+      if (signalManager.getSignal(i, item)) {
+        if (item.signal.address == signal.address && item.signal.key == signal.key) {
+          isDuplicate = true;
+          Serial.printf("[SIGNAL_MGR] 信号已存在，跳过: %s%s\n", 
+                       signal.address.c_str(), signal.key.c_str());
+          break;
+        }
+      }
+    }
+    
+    // 只有不重复的信号才添加
+    if (!isDuplicate) {
+      // 生成自动名称
+      String autoName = "Signal_" + String(signalManager.getCount() + 1);
+      signalManager.addSignal(autoName, signal);
+      Serial.printf("[SIGNAL_MGR] 信号已添加到管理器: %s (%s%s)\n", 
+                   autoName.c_str(), signal.address.c_str(), signal.key.c_str());
+    }
+    
+    // 捕获一个信号后自动退出捕获模式
     capturedSignal = signal;  // 保存完整的信号（地址码+按键值）
     signalCaptured = true;
     replayMode = false;  // 捕获完成后退出复刻模式
     currentLEDState = LED_ON;  // 完成复刻，LED常亮
+    rf.disableCaptureMode();  // 禁用库的捕获模式
+    Serial.println("[CAPTURE] 已退出捕获模式");
     
-    // 保存到闪存
+    // 保存到闪存（向后兼容）
     saveSignalToFlash();
     
     // 计算实际发送的24位数据（前24位，去掉最后8位）
@@ -274,10 +309,22 @@ void buttonTask(void *parameter) {
             unsigned long pressDuration = millis() - buttonPressStartTime;
             
             if (!longPressTriggered && pressDuration < longPressDuration) {
-              // 短按：发送复刻信号
-              Serial.printf("[BUTTON] 短按检测（%lums）：发送复刻信号\n", pressDuration);
+              // 短按：优先发送Web绑定的信号，否则发送复刻信号
+              Serial.printf("[BUTTON] 短按检测（%lums）\n", pressDuration);
               
-              if (signalCaptured) {
+              // 检查是否有Web绑定的信号
+              int8_t boundIndex = webManager.getBootBoundIndex();
+              if (boundIndex >= 0) {
+                // 发送Web绑定的信号
+                Serial.printf("[BUTTON] 发送Web绑定信号 #%d\n", boundIndex);
+                if (signalManager.sendSignal(boundIndex, rf)) {
+                  Serial.println("[BUTTON] Web绑定信号已发送");
+                  sendCount++;
+                } else {
+                  Serial.println("[BUTTON] 警告：Web绑定信号发送失败");
+                }
+              } else if (signalCaptured) {
+                // 发送复刻信号
                 currentSent = capturedSignal;  // 记录发送的信号用于验证
                 Serial.printf("[REPLAY] 发送复刻信号: %s%s\n", 
                              capturedSignal.address.c_str(), capturedSignal.key.c_str());
@@ -301,8 +348,8 @@ void buttonTask(void *parameter) {
                 rf.send(capturedSignal);  // 发送完整信号（地址码+按键值）
                 sendCount++;
               } else {
-                Serial.println("[REPLAY] 警告：没有捕获的信号，请先使用 'capture' 命令");
-                Serial.println("[REPLAY] 提示：可以使用 'test' 命令测试发送功能");
+                Serial.println("[BUTTON] 警告：没有绑定或捕获的信号");
+                Serial.println("[BUTTON] 提示：在Web界面绑定信号或使用 'capture' 命令捕获信号");
               }
             } else if (longPressTriggered) {
               Serial.println("[BUTTON] 长按释放：复刻信号已清空");
@@ -369,6 +416,23 @@ void setup() {
   
   // 设置接收回调
   rf.setReceiveCallback(onReceive);
+  
+  // 初始化信号管理器
+  signalManager.begin();
+  Serial.println("[SIGNAL_MGR] 信号管理器已初始化");
+  
+  // 初始化Web管理界面（WiFi AP模式）
+  webManager.begin("ESP433RF", "12345678");
+  webManager.setCaptureModeCallback([](bool enabled) {
+    if (enabled) {
+      replayMode = true;
+      currentLEDState = LED_BLINK;
+      Serial.println("[WEB] 通过Web界面进入捕获模式");
+    }
+  });
+  Serial.println("[WEB] Web管理界面已启动");
+  Serial.printf("[WEB] 请连接WiFi: ESP433RF, 密码: 12345678\n");
+  Serial.printf("[WEB] 然后访问: http://%s\n", webManager.getAPIP().c_str());
   
   Serial.println("ESP433RF库已初始化");
   Serial.printf("  协议: Protocol 1 (EV1527/PT2262)\n");
@@ -439,190 +503,23 @@ void setup() {
   Serial.println("\nRTOS任务已启动，系统就绪");
   Serial.println("\n复刻功能说明:");
   Serial.println("  - 系统启动时会自动从闪存加载保存的信号（关机不丢失）");
-  Serial.println("  - 系统启动时如果没有复刻信号，会自动进入复刻模式");
-  Serial.println("  - 使用 'capture' 命令可手动进入复刻模式，然后按下遥控器");
-  Serial.println("  - 捕获信号后会自动保存到闪存，关机后仍可恢复");
-  Serial.printf("  - 捕获信号后，短按boot按键（GPIO%d）发送复刻信号\n", REPLAY_BUTTON_PIN);
-  Serial.printf("  - 长按boot按键（GPIO%d）2秒可清空复刻信号（内存+闪存，自动进入复刻模式）\n", REPLAY_BUTTON_PIN);
+  Serial.printf("  - 短按boot按键（GPIO%d）发送绑定的信号\n", REPLAY_BUTTON_PIN);
+  Serial.printf("  - 长按boot按键（GPIO%d）2秒可清空复刻信号\n", REPLAY_BUTTON_PIN);
   Serial.println("  - LED指示灯状态（反向逻辑：HIGH熄灭，LOW常亮）：");
-  Serial.println("    * 熄灭（HIGH）：没有复刻信号（自动进入复刻模式）");
-  Serial.println("    * 快闪：复刻模式，等待接收信号");
-  Serial.println("    * 常亮（LOW）：完成复刻，已捕获信号");
-  Serial.println("  - 使用 'replay' 命令复刻最后接收的信号");
-  Serial.println("  - 使用 'list' 命令查看所有保存的信号");
-  Serial.println("  - 使用 'replay:N' 复刻第N个信号");
-  Serial.println("  - 使用 'send:XXXXXXYY' 手动发送信号");
-  Serial.println("  - 使用 'help' 查看所有命令");
+  Serial.println("    * 熄灭（HIGH）：待机状态");
+  Serial.println("    * 快闪：捕获模式，等待接收信号");
+  Serial.println("    * 常亮（LOW）：已捕获信号");
+  Serial.println("");
+  Serial.println("📱 Web管理界面:");
+  Serial.printf("  - WiFi SSID: %s\n", "ESP433RF");
+  Serial.printf("  - WiFi密码: %s\n", "12345678");
+  Serial.printf("  - 访问地址: http://%s\n", webManager.getAPIP().c_str());
+  Serial.println("  - 功能: 捕获信号、发送信号、绑定Boot按钮、清空信号");
 }
 
 void loop() {
-  // 处理串口命令
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    
-    if (cmd == "test") {
-      Serial.println("手动发送测试信号...");
-      RFSignal testSignal = {"62E7E8", "31"};
-      currentSent = testSignal;  // 记录发送的信号用于验证
-      for (int i = 0; i < 3; i++) {
-        Serial.printf("发送 %d/3\n", i+1);
-        rf.send(testSignal);
-        delay(100);
-      }
-      sendCount++;
-    } else if (cmd == "button" || cmd == "btn") {
-      // 测试按钮功能（模拟按钮按下）
-      Serial.printf("模拟按钮按下（GPIO%d）\n", REPLAY_BUTTON_PIN);
-      bool currentState = digitalRead(REPLAY_BUTTON_PIN);
-      Serial.printf("当前按钮状态: %s\n", currentState == HIGH ? "HIGH(未按下)" : "LOW(按下)");
-      if (signalCaptured) {
-        Serial.printf("发送捕获的信号: %s%s\n", 
-                     capturedSignal.address.c_str(), capturedSignal.key.c_str());
-        currentSent = capturedSignal;
-        rf.send(capturedSignal);
-        sendCount++;
-      } else {
-        Serial.println("提示：没有捕获的信号，使用 'capture' 命令先捕获信号");
-        Serial.println("或者使用 'test' 命令测试发送功能");
-      }
-    } else if (cmd == "capture" || cmd == "c") {
-      // 进入复刻模式，等待接收信号
-      replayMode = true;
-      signalCaptured = false;
-      capturedSignal = {"", ""};
-      currentLEDState = LED_BLINK;  // 进入复刻模式，LED快闪
-      Serial.println("[REPLAY] 已进入复刻模式，请按下遥控器...");
-      Serial.println("[REPLAY] 等待接收信号...");
-      Serial.println("[REPLAY] LED指示灯快闪中...");
-    } else if (cmd == "replay" || cmd == "r") {
-      // 复刻最后接收到的信号
-      if (lastReceived.address.length() > 0) {
-        currentSent = lastReceived;  // 记录发送的信号用于验证
-        Serial.printf("复刻最后接收的信号: %s%s\n", 
-                     lastReceived.address.c_str(), lastReceived.key.c_str());
-        Serial.println("发送3次...");
-        for (int i = 0; i < 3; i++) {
-          rf.send(lastReceived);
-          delay(100);
-        }
-        sendCount++;
-      } else {
-        Serial.println("错误：没有接收到任何信号，无法复刻");
-      }
-    } else if (cmd == "send" || cmd == "s") {
-      // 发送已捕获的信号（通过GPIO按钮或串口命令）
-      if (signalCaptured) {
-        currentSent = capturedSignal;  // 记录发送的信号用于验证
-        Serial.printf("发送捕获的信号: %s%s\n", 
-                     capturedSignal.address.c_str(), capturedSignal.key.c_str());
-        Serial.println("发送3次...");
-        for (int i = 0; i < 3; i++) {
-          rf.send(capturedSignal);
-          delay(100);
-        }
-        sendCount++;
-      } else {
-        Serial.println("错误：没有捕获的信号，请先使用 'capture' 命令");
-      }
-    } else if (cmd == "list" || cmd == "l") {
-      // 列出复刻缓冲区中的所有信号
-      Serial.printf("复刻缓冲区 (%d个信号):\n", replayBufferCount);
-      int startIdx = (replayBufferIndex - replayBufferCount + REPLAY_BUFFER_SIZE) % REPLAY_BUFFER_SIZE;
-      for (int i = 0; i < replayBufferCount; i++) {
-        int idx = (startIdx + i) % REPLAY_BUFFER_SIZE;
-        Serial.printf("  [%d] %s%s\n", i + 1, 
-                     replayBuffer[idx].address.c_str(), 
-                     replayBuffer[idx].key.c_str());
-      }
-    } else if (cmd.startsWith("replay:")) {
-      // 复刻指定索引的信号: replay:1, replay:2, etc.
-      int index = cmd.substring(7).toInt() - 1;
-      if (index >= 0 && index < replayBufferCount) {
-        int startIdx = (replayBufferIndex - replayBufferCount + REPLAY_BUFFER_SIZE) % REPLAY_BUFFER_SIZE;
-        int idx = (startIdx + index) % REPLAY_BUFFER_SIZE;
-        RFSignal signal = replayBuffer[idx];
-        currentSent = signal;  // 记录发送的信号用于验证
-        Serial.printf("复刻信号 [%d]: %s%s\n", index + 1, 
-                     signal.address.c_str(), signal.key.c_str());
-        Serial.println("发送3次...");
-        for (int i = 0; i < 3; i++) {
-          rf.send(signal);
-          delay(100);
-        }
-        sendCount++;
-      } else {
-        Serial.printf("错误：索引 %d 无效（范围: 1-%d）\n", index + 1, replayBufferCount);
-      }
-    } else if (cmd.startsWith("send:")) {
-      // 手动发送指定信号: send:62E7E831
-      String signalStr = cmd.substring(5);
-      signalStr.trim();
-      signalStr.toUpperCase();
-      if (signalStr.length() >= 8) {
-        RFSignal signal;
-        signal.address = signalStr.substring(0, 6);
-        signal.key = signalStr.substring(6, 8);
-        currentSent = signal;  // 记录发送的信号用于验证
-        Serial.printf("发送信号: %s%s\n", signal.address.c_str(), signal.key.c_str());
-        Serial.println("发送3次...");
-        for (int i = 0; i < 3; i++) {
-          rf.send(signal);
-          delay(100);
-        }
-        sendCount++;
-      } else {
-        Serial.println("错误：信号格式错误，应为8位十六进制（如: 62E7E831）");
-      }
-    } else if (cmd == "status") {
-      Serial.printf("发送:%lu次, 接收:%lu次, 测试:%s\n", 
-                    rf.getSendCount(), rf.getReceiveCount(), 
-                    testPassed ? "通过" : "进行中");
-      Serial.printf("复刻缓冲区: %d个信号\n", replayBufferCount);
-      if (lastReceived.address.length() > 0) {
-        Serial.printf("最后接收: %s%s\n", 
-                     lastReceived.address.c_str(), lastReceived.key.c_str());
-      }
-      if (signalCaptured) {
-        Serial.printf("已捕获信号: %s%s (可通过GPIO%d按钮或'send'命令发送)\n", 
-                     capturedSignal.address.c_str(), capturedSignal.key.c_str(), REPLAY_BUTTON_PIN);
-      } else {
-        Serial.println("未捕获信号（使用 'capture' 命令进入复刻模式）");
-      }
-      Serial.printf("复刻模式: %s\n", replayMode ? "等待接收信号..." : "未激活");
-    } else if (cmd == "reset") {
-      rf.resetCounters();
-      sendCount = 0;
-      receiveCount = 0;
-      testPassed = false;
-      replayBufferCount = 0;
-      replayBufferIndex = 0;
-      lastReceived = {"", ""};
-      replayMode = true;  // 重置后自动进入复刻模式
-      signalCaptured = false;
-      capturedSignal = {"", ""};
-      currentLEDState = LED_BLINK;  // LED快闪，等待接收信号
-      
-      // 清空闪存
-      saveSignalToFlash();
-      
-      Serial.println("计数器已重置，自动进入复刻模式（LED快闪）");
-    } else if (cmd == "help" || cmd == "h") {
-      Serial.println("可用命令:");
-      Serial.println("  capture / c   - 进入复刻模式，等待接收信号（LED快闪）");
-      Serial.printf("  send / s      - 发送已捕获的信号（或短按boot按键GPIO%d）\n", REPLAY_BUTTON_PIN);
-      Serial.printf("  长按boot按键（GPIO%d）2秒 - 清空复刻信号（自动进入复刻模式）\n", REPLAY_BUTTON_PIN);
-      Serial.printf("  button / btn  - 测试按钮功能（模拟按钮按下）\n");
-      Serial.println("  replay / r    - 复刻最后接收的信号");
-      Serial.println("  list / l      - 列出复刻缓冲区中的所有信号");
-      Serial.println("  replay:N      - 复刻第N个信号（如: replay:1）");
-      Serial.println("  send:XXXXXXYY - 发送指定信号（如: send:62E7E831）");
-      Serial.println("  test          - 发送测试信号");
-      Serial.println("  status        - 显示状态");
-      Serial.println("  reset         - 重置计数器");
-      Serial.println("  help / h      - 显示帮助");
-    }
-  }
+  // 处理Web请求
+  webManager.handleClient();
   
   delay(100);
 }
