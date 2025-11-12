@@ -1,9 +1,12 @@
 # ESP32-S3 433MHz 智能遥控器 📡
 
+
 <p align="center">
   <img src="docs/管理页面.PNG" width="300" alt="管理页面"/>
   <img src="docs/wifi界面.PNG" width="300" alt="WiFi连接"/>
 </p>
+
+【B 站视频演示】 https://www.bilibili.com/video/BV12R19B5EsX/?share_source=copy_web&vd_source=2457af4049d64bc1546325052ddb1d50
 
 > 🎓 **学习分享项目** - 基于立创ESP32-S3-R8N8开发板的433MHz射频信号管理系统  
 > 支持手机WiFi连接控制，信号学习、存储、发送一键搞定！
