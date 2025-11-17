@@ -1,10 +1,13 @@
 #include <Arduino.h>
 // 启用RCSwitch库支持
 #define USE_RCSWITCH 1
-#include <ESP433RF.h>
+#include <ESPMultiRF.h>
 #include <Preferences.h>  // ESP32闪存存储库
 #include <SignalManager.h>  // 信号管理库
-#include <ESP433RFWeb.h>    // Web管理界面库
+#include <ESPMultiRFWeb.h>    // Web管理界面库
+
+// 调试开关 - 设置为1启用详细调试信息，0禁用
+#define DEBUG_CAPTURE_MODE 1
 
 // 硬件引脚定义
 #define TX_PIN 14       // 发射模块DATA引脚
@@ -40,14 +43,15 @@ static uint32_t sendCount = 0;
 static uint32_t receiveCount = 0;
 static bool testPassed = false;
 
-// 创建ESP433RF实例
-ESP433RF rf(TX_PIN, RX_PIN, 9600);
+// 创建ESPMultiRF实例（支持433MHz和315MHz）
+// 参数：TX433, RX433, TX315, RX315, 波特率
+ESPMultiRF rf(TX_PIN, RX_PIN, 15, 19, 9600);  // TODO: 更新315MHz引脚
 
 // 创建信号管理器实例（最多50个信号）
 SignalManager signalManager(50);
 
 // 创建Web管理界面实例
-ESP433RFWeb webManager(rf, signalManager);
+ESPMultiRFWeb webManager(rf, signalManager);
 
 // 闪存存储实例（保留用于向后兼容）
 Preferences preferences;
@@ -100,7 +104,36 @@ void loadSignalFromFlash() {
 // 接收回调函数
 void onReceive(RFSignal signal) {
   receiveCount++;
-  Serial.printf("[RECV] 第%lu次接收: %s%s\n", receiveCount, signal.address.c_str(), signal.key.c_str());
+  Serial.println("========================================");
+  Serial.printf("[RECV] 第%lu次接收信号\n", receiveCount);
+  Serial.printf("[RECV] 地址码: %s (长度: %d)\n", signal.address.c_str(), signal.address.length());
+  Serial.printf("[RECV] 按键值: %s (长度: %d)\n", signal.key.c_str(), signal.key.length());
+  Serial.printf("[RECV] 完整数据: %s%s\n", signal.address.c_str(), signal.key.c_str());
+  
+  // 显示十六进制表示
+  String fullHex = signal.address + signal.key;
+  Serial.printf("[RECV] 十六进制: ");
+  for (int i = 0; i < fullHex.length(); i++) {
+    char c = fullHex.charAt(i);
+    Serial.printf("%c", c);
+    if ((i + 1) % 2 == 0 && i < fullHex.length() - 1) {
+      Serial.printf(" ");
+    }
+  }
+  Serial.println();
+  
+  // 计算数值
+  uint32_t fullData = 0;
+  for (int i = 0; i < fullHex.length() && i < 8; i++) {
+    char c = fullHex.charAt(i);
+    uint8_t val = 0;
+    if (c >= '0' && c <= '9') val = c - '0';
+    else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+    else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+    fullData = (fullData << 4) | val;
+  }
+  Serial.printf("[RECV] 数值表示: 32位=0x%08lX, 十进制=%lu\n", fullData, fullData);
+  Serial.println("========================================");
   
   // 保存接收到的信号到复刻缓冲区（向后兼容）
   lastReceived = signal;
@@ -111,7 +144,16 @@ void onReceive(RFSignal signal) {
   }
   
   // 只在捕获模式下添加到信号管理器
+  #if DEBUG_CAPTURE_MODE
+  Serial.printf("[DEBUG] onReceive: 检查捕获模式 - replayMode=%d, rf.isCaptureMode()=%d\n", 
+               replayMode, rf.isCaptureMode());
+  #endif
+  
   if (replayMode || rf.isCaptureMode()) {
+    #if DEBUG_CAPTURE_MODE
+    Serial.printf("[DEBUG] onReceive: 进入捕获处理逻辑\n");
+    #endif
+    
     // 去重：检查是否已存在相同的信号
     bool isDuplicate = false;
     uint8_t count = signalManager.getCount();
@@ -143,6 +185,11 @@ void onReceive(RFSignal signal) {
     currentLEDState = LED_ON;  // 完成复刻，LED常亮
     rf.disableCaptureMode();  // 禁用库的捕获模式
     Serial.println("[CAPTURE] 已退出捕获模式");
+    
+    #if DEBUG_CAPTURE_MODE
+    Serial.printf("[DEBUG] onReceive: 捕获完成 - signalCaptured=%d, replayMode=%d, isCaptureMode=%d\n",
+                 signalCaptured, replayMode, rf.isCaptureMode());
+    #endif
     
     // 保存到闪存（向后兼容）
     saveSignalToFlash();
@@ -219,11 +266,45 @@ void onReceive(RFSignal signal) {
 void receiveTask(void *parameter) {
   while (true) {
     // 检查接收（回调函数会自动处理）
-    if (rf.receiveAvailable()) {
+    int availableBytes = Serial1.available();
+    
+    if (availableBytes > 0) {
+      #if DEBUG_CAPTURE_MODE
+      static unsigned long lastDebugTime = 0;
+      if (millis() - lastDebugTime > 1000) {  // 每秒输出一次状态
+        Serial.printf("[DEBUG] receiveTask: 串口有数据可用, available=%d 字节\n", availableBytes);
+        Serial.printf("[DEBUG] receiveTask: replayMode=%d, isCaptureMode=%d, receiveEnabled=%d\n", 
+                     replayMode, rf.isCaptureMode(), rf.isReceiving());
+        lastDebugTime = millis();
+      }
+      #endif
+      
       RFSignal signal;
       if (rf.receive(signal)) {
+        #if DEBUG_CAPTURE_MODE
+        Serial.printf("[DEBUG] receiveTask: ✓ 成功接收到信号\n");
+        #endif
         // 回调函数已经处理了验证逻辑
+      } else {
+        #if DEBUG_CAPTURE_MODE
+        Serial.printf("[DEBUG] receiveTask: ✗ receive()返回false，可能解析失败\n");
+        #endif
       }
+    } else {
+      #if DEBUG_CAPTURE_MODE
+      static unsigned long lastNoDataTime = 0;
+      static unsigned long lastNoDataLog = 0;
+      if (millis() - lastNoDataTime > 5000) {  // 每5秒输出一次
+        if (millis() - lastNoDataLog > 5000) {
+          Serial.printf("[DEBUG] receiveTask: 串口无数据, available=%d\n", availableBytes);
+          Serial.printf("[DEBUG] receiveTask: 当前状态 - replayMode=%d, isCaptureMode=%d\n", 
+                       replayMode, rf.isCaptureMode());
+          Serial.printf("[DEBUG] receiveTask: 接收引脚 GPIO%d, 波特率 9600\n", RX_PIN);
+          lastNoDataLog = millis();
+        }
+        lastNoDataTime = millis();
+      }
+      #endif
     }
     
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -403,10 +484,10 @@ void setup() {
   delay(2000);
   
   Serial.println("========================================");
-  Serial.println("ESP32 433MHz 收发测试 (使用ESP433RF库)");
+  Serial.println("ESP32 433MHz 收发测试 (使用ESPMultiRF库)");
   Serial.println("========================================");
   
-  // 初始化ESP433RF库（仅支持RCSwitch模式）
+  // 初始化ESPMultiRF库（仅支持RCSwitch模式）
   rf.begin();
   
   // 配置库参数
@@ -422,19 +503,31 @@ void setup() {
   Serial.println("[SIGNAL_MGR] 信号管理器已初始化");
   
   // 初始化Web管理界面（WiFi AP模式）
-  webManager.begin("ESP433RF", "12345678");
+  webManager.begin("ESPMultiRF", "12345678");
   webManager.setCaptureModeCallback([](bool enabled) {
     if (enabled) {
       replayMode = true;
       currentLEDState = LED_BLINK;
+      rf.enableCaptureMode();  // 确保库的捕获模式也被启用
       Serial.println("[WEB] 通过Web界面进入捕获模式");
+      #if DEBUG_CAPTURE_MODE
+      Serial.printf("[DEBUG] setCaptureModeCallback: replayMode=%d, rf.isCaptureMode()=%d\n",
+                   replayMode, rf.isCaptureMode());
+      Serial.printf("[DEBUG] setCaptureModeCallback: LED状态=%d (0=OFF,1=BLINK,2=ON)\n", currentLEDState);
+      #endif
+    } else {
+      replayMode = false;
+      rf.disableCaptureMode();
+      #if DEBUG_CAPTURE_MODE
+      Serial.printf("[DEBUG] setCaptureModeCallback: 退出捕获模式\n");
+      #endif
     }
   });
   Serial.println("[WEB] Web管理界面已启动");
-  Serial.printf("[WEB] 请连接WiFi: ESP433RF, 密码: 12345678\n");
+  Serial.printf("[WEB] 请连接WiFi: ESPMultiRF, 密码: 12345678\n");
   Serial.printf("[WEB] 然后访问: http://%s\n", webManager.getAPIP().c_str());
   
-  Serial.println("ESP433RF库已初始化");
+  Serial.println("ESPMultiRF库已初始化");
   Serial.printf("  协议: Protocol 1 (EV1527/PT2262)\n");
   Serial.printf("  脉冲长度: 320μs\n");
   Serial.printf("  重复次数: 5次\n");
@@ -525,7 +618,7 @@ void setup() {
   Serial.println("    * 常亮（LOW）：已捕获信号");
   Serial.println("");
   Serial.println("📱 Web管理界面:");
-  Serial.printf("  - WiFi SSID: %s\n", "ESP433RF");
+  Serial.printf("  - WiFi SSID: %s\n", "ESPMultiRF");
   Serial.printf("  - WiFi密码: %s\n", "12345678");
   Serial.printf("  - 访问地址: http://%s\n", webManager.getAPIP().c_str());
   Serial.println("  - 功能: 捕获信号、发送信号、绑定Boot按钮、清空信号");

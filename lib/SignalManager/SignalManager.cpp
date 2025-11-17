@@ -175,7 +175,7 @@ void SignalManager::clear() {
   #endif
 }
 
-bool SignalManager::sendSignal(uint8_t index, ESP433RF& rf) {
+bool SignalManager::sendSignal(uint8_t index, ESPMultiRF& rf) {
   if (_signals == nullptr || index >= _count) {
     return false;
   }
@@ -199,7 +199,7 @@ bool SignalManager::sendSignal(uint8_t index, ESP433RF& rf) {
   return true;
 }
 
-bool SignalManager::sendSignal(const String& name, ESP433RF& rf) {
+bool SignalManager::sendSignal(const String& name, ESPMultiRF& rf) {
   if (_signals == nullptr) {
     return false;
   }

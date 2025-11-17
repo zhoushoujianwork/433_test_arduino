@@ -11,7 +11,7 @@
 #define SIGNAL_MANAGER_H
 
 #include <Arduino.h>
-#include "ESP433RF.h"
+#include "ESPMultiRF.h"
 
 #ifdef ESP32
 #include <Preferences.h>
@@ -46,8 +46,8 @@ public:
   void clear();
   
   // 发送信号
-  bool sendSignal(uint8_t index, ESP433RF& rf);
-  bool sendSignal(const String& name, ESP433RF& rf);
+  bool sendSignal(uint8_t index, ESPMultiRF& rf);
+  bool sendSignal(const String& name, ESPMultiRF& rf);
   
   // 持久化存储（ESP32）
   #ifdef ESP32

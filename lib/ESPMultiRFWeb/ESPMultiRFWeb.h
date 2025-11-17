@@ -1,5 +1,5 @@
 /*
- * ESP433RFWeb - 433MHz信号Web管理界面库
+ * ESPMultiRFWeb - 433MHz信号Web管理界面库
  * 
  * 提供WiFi AP模式和Web管理界面，支持信号列表查看、添加、删除、发送
  * 
@@ -7,11 +7,11 @@
  * License: MIT
  */
 
-#ifndef ESP433RFWEB_H
-#define ESP433RFWEB_H
+#ifndef ESPMultiRFWEB_H
+#define ESPMultiRFWEB_H
 
 #include <Arduino.h>
-#include "ESP433RF.h"
+#include "ESPMultiRF.h"
 #include "SignalManager.h"
 
 #ifdef ESP32
@@ -20,13 +20,13 @@
 #include <Preferences.h>
 #endif
 
-class ESP433RFWeb {
+class ESPMultiRFWeb {
 public:
   // 构造函数
-  ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr);
+  ESPMultiRFWeb(ESPMultiRF& rf, SignalManager& signalMgr);
   
   // 初始化
-  void begin(const char* ssid = "ESP433RF", const char* password = "12345678");
+  void begin(const char* ssid = "ESPMultiRF", const char* password = "12345678");
   void end();
   void handleClient();  // 需要在loop中调用
   
@@ -43,7 +43,7 @@ public:
   int8_t getBootBoundIndex() { return _bootBoundIndex; }
   
 private:
-  ESP433RF& _rf;
+  ESPMultiRF& _rf;
   SignalManager& _signalMgr;
   
   #ifdef ESP32
@@ -63,5 +63,5 @@ private:
   #endif
 };
 
-#endif // ESP433RFWEB_H
+#endif // ESPMultiRFWEB_H
 

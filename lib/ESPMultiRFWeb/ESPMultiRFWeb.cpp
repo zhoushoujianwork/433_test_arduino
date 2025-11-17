@@ -1,14 +1,14 @@
 /*
- * ESP433RFWeb - 433MHz信号Web管理界面库实现
+ * ESPMultiRFWeb - 433MHz信号Web管理界面库实现
  */
 
-#include "ESP433RFWeb.h"
+#include "ESPMultiRFWeb.h"
 
-ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr) 
+ESPMultiRFWeb::ESPMultiRFWeb(ESPMultiRF& rf, SignalManager& signalMgr) 
   : _rf(rf), _signalMgr(signalMgr) {
   #ifdef ESP32
   _server = nullptr;
-  _apSSID = "ESP433RF";
+  _apSSID = "ESPMultiRF";
   _apPassword = "12345678";
   _apStarted = false;
   _captureCallback = nullptr;
@@ -16,7 +16,7 @@ ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
   #endif
 }
  
- void ESP433RFWeb::begin(const char* ssid, const char* password) {
+ void ESPMultiRFWeb::begin(const char* ssid, const char* password) {
    #ifdef ESP32
    _apSSID = String(ssid);
    _apPassword = String(password);
@@ -47,7 +47,7 @@ ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
    #endif
  }
  
- void ESP433RFWeb::end() {
+ void ESPMultiRFWeb::end() {
    #ifdef ESP32
    if (_server != nullptr) {
      _server->stop();
@@ -62,7 +62,7 @@ ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
    #endif
  }
  
- void ESP433RFWeb::handleClient() {
+ void ESPMultiRFWeb::handleClient() {
    #ifdef ESP32
    if (_server != nullptr) {
      _server->handleClient();
@@ -70,14 +70,14 @@ ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
    #endif
  }
  
- void ESP433RFWeb::setAPCredentials(const char* ssid, const char* password) {
+ void ESPMultiRFWeb::setAPCredentials(const char* ssid, const char* password) {
    #ifdef ESP32
    _apSSID = String(ssid);
    _apPassword = String(password);
    #endif
  }
  
- String ESP433RFWeb::getAPIP() {
+ String ESPMultiRFWeb::getAPIP() {
    #ifdef ESP32
    if (_apStarted) {
      return WiFi.softAPIP().toString();
@@ -86,21 +86,21 @@ ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
    return "";
  }
  
- bool ESP433RFWeb::isAPMode() {
+ bool ESPMultiRFWeb::isAPMode() {
    #ifdef ESP32
    return _apStarted;
    #endif
    return false;
  }
  
- void ESP433RFWeb::setCaptureModeCallback(CaptureModeCallback callback) {
+ void ESPMultiRFWeb::setCaptureModeCallback(CaptureModeCallback callback) {
    #ifdef ESP32
    _captureCallback = callback;
    #endif
  }
  
 #ifdef ESP32
-void ESP433RFWeb::handleRoot() {
+void ESPMultiRFWeb::handleRoot() {
   String html = R"HTML(
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -463,7 +463,7 @@ void ESP433RFWeb::handleRoot() {
    _server->send(200, "text/html", html);
  }
  
- void ESP433RFWeb::handleAPI() {
+ void ESPMultiRFWeb::handleAPI() {
    if (!_server->hasArg("action")) {
      sendJSONResponse(400, "缺少action参数");
      return;
@@ -527,10 +527,15 @@ void ESP433RFWeb::handleRoot() {
    }
   else if (action == "capture") {
     // 进入捕获模式
+    Serial.println("[WEB] API捕获请求: 开始进入捕获模式");
     if (_captureCallback != nullptr) {
+      Serial.println("[WEB] 调用捕获回调函数");
       _captureCallback(true);
+    } else {
+      Serial.println("[WEB] 警告: 捕获回调函数未设置");
     }
     _rf.enableCaptureMode();
+    Serial.printf("[WEB] 捕获模式状态: rf.isCaptureMode()=%d\n", _rf.isCaptureMode());
     sendJSONResponse(200, "已进入捕获模式，请按下遥控器按键");
   }
   else if (action == "bind_boot") {
@@ -575,11 +580,11 @@ void ESP433RFWeb::handleRoot() {
   }
 }
  
- void ESP433RFWeb::handleNotFound() {
+ void ESPMultiRFWeb::handleNotFound() {
    sendJSONResponse(404, "页面未找到");
  }
  
-void ESP433RFWeb::sendJSONResponse(int code, const String& message, const String& data) {
+void ESPMultiRFWeb::sendJSONResponse(int code, const String& message, const String& data) {
   String json = "{\"code\":" + String(code) + ",\"message\":\"" + message + "\"";
   if (data.length() > 0) {
     // data已经是JSON字符串，直接嵌入（不要加引号）
@@ -593,7 +598,7 @@ void ESP433RFWeb::sendJSONResponse(int code, const String& message, const String
   _server->send(code, "application/json", json);
 }
 
-String ESP433RFWeb::getSignalListJSON() {
+String ESPMultiRFWeb::getSignalListJSON() {
   uint8_t count = _signalMgr.getCount();
   Serial.printf("[API] getSignalListJSON: count=%d\n", count);
   
