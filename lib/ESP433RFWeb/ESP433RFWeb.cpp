@@ -44,6 +44,9 @@ ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
    
    _server->begin();
    Serial.println("[Web] Web服务器已启动");
+
+   // 加载持久化配置
+   loadWebConfig();
    #endif
  }
  
@@ -499,6 +502,14 @@ void ESP433RFWeb::handleRoot() {
      
      uint8_t index = _server->arg("index").toInt();
      if (_signalMgr.removeSignal(index)) {
+       // 更新Boot绑定索引
+       if (_bootBoundIndex == index) {
+         _bootBoundIndex = -1;
+         saveWebConfig();
+       } else if (_bootBoundIndex > index) {
+         _bootBoundIndex--;
+         saveWebConfig();
+       }
        sendJSONResponse(200, "信号已删除");
      } else {
        sendJSONResponse(400, "删除失败：索引无效");
@@ -543,6 +554,7 @@ void ESP433RFWeb::handleRoot() {
     uint8_t index = _server->arg("index").toInt();
     if (index < _signalMgr.getCount()) {
       _bootBoundIndex = index;
+      saveWebConfig();
       Serial.printf("[WEB] Boot按钮已绑定到信号 #%d\n", index);
       sendJSONResponse(200, "Boot按钮已绑定");
     } else {
@@ -552,6 +564,7 @@ void ESP433RFWeb::handleRoot() {
   else if (action == "unbind_boot") {
     // 解绑Boot按钮
     _bootBoundIndex = -1;
+    saveWebConfig();
     Serial.println("[WEB] Boot按钮已解绑");
     sendJSONResponse(200, "Boot按钮已解绑");
   }
@@ -567,6 +580,7 @@ void ESP433RFWeb::handleRoot() {
       _signalMgr.removeSignal(i);
     }
     _bootBoundIndex = -1;  // 清空绑定
+    saveWebConfig();
     Serial.println("[WEB] 所有信号已清空");
     sendJSONResponse(200, "所有信号已清空");
   }
@@ -601,28 +615,46 @@ String ESP433RFWeb::getSignalListJSON() {
     return "[]";
   }
   
-  SignalItem* items = new SignalItem[count];
-  if (!_signalMgr.getAllSignals(items, count)) {
-    Serial.println("[API] getAllSignals failed");
-    delete[] items;
-    return "[]";
-  }
-  
   String json = "[";
+  SignalItem item;
+  bool first = true;
   for (uint8_t i = 0; i < count; i++) {
-    if (i > 0) json += ",";
-    json += "{";
-    json += "\"name\":\"" + items[i].name + "\",";
-    json += "\"address\":\"" + items[i].signal.address + "\",";
-    json += "\"key\":\"" + items[i].signal.key + "\"";
-    json += "}";
-    Serial.printf("[API] Signal %d: %s (%s%s)\n", i, items[i].name.c_str(), 
-                 items[i].signal.address.c_str(), items[i].signal.key.c_str());
+    if (_signalMgr.getSignal(i, item)) {
+      if (!first) json += ",";
+      json += "{";
+      json += "\"name\":\"" + item.name + "\",";
+      json += "\"address\":\"" + item.signal.address + "\",";
+      json += "\"key\":\"" + item.signal.key + "\"";
+      json += "}";
+      first = false;
+      Serial.printf("[API] Signal %d: %s (%s%s)\n", i, item.name.c_str(),
+                   item.signal.address.c_str(), item.signal.key.c_str());
+    }
   }
   json += "]";
   
-  delete[] items;
-  Serial.printf("[API] JSON: %s\n", json.c_str());
+  Serial.printf("[API] JSON length: %d\n", json.length());
   return json;
+}
+
+void ESP433RFWeb::saveWebConfig() {
+  _webPrefs.begin("web_mgr", false);
+  _webPrefs.putChar("boot_idx", (int8_t)_bootBoundIndex);
+  _webPrefs.end();
+  Serial.printf("[WEB] 配置已保存: boot_idx=%d\n", _bootBoundIndex);
+}
+
+void ESP433RFWeb::loadWebConfig() {
+  _webPrefs.begin("web_mgr", true);
+  _bootBoundIndex = _webPrefs.getChar("boot_idx", -1);
+  _webPrefs.end();
+
+  // 验证加载的索引是否有效
+  if (_bootBoundIndex >= 0 && _bootBoundIndex >= _signalMgr.getCount()) {
+    Serial.printf("[WEB] 加载的索引无效(out of bounds): %d, 重置为-1\n", _bootBoundIndex);
+    _bootBoundIndex = -1;
+  }
+
+  Serial.printf("[WEB] 配置已加载: boot_idx=%d\n", _bootBoundIndex);
 }
 #endif
