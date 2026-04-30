@@ -1,0 +1,67 @@
+name: Build and Release Firmware
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Cache PlatformIO
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.platformio
+          .pio
+        key: ${{ runner.os }}-pio-${{ hashFiles('**/platformio.ini') }}
+        restore-keys: |
+          ${{ runner.os }}-pio-
+
+    - name: Install PlatformIO
+      run: |
+        pip install platformio
+
+    - name: Build firmware
+      run: |
+        pio run
+
+    - name: Merge firmware files
+      run: |
+        python scripts/merge_bin.py
+
+    - name: Create firmware package
+      run: |
+        cd web-flasher
+        zip -r ../firmware-package.zip flasher-standalone.html firmware.bin README.md
+        zip -r ../firmware-online.zip index.html manifest.json firmware.bin README.md
+
+    - name: Upload firmware to release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          web-flasher/firmware.bin
+          firmware-package.zip
+          firmware-online.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: firmware
+        path: |
+          web-flasher/firmware.bin
+          firmware-package.zip
+          firmware-online.zip

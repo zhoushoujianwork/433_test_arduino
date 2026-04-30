@@ -4,10 +4,11 @@
 
 #include "ESP433RFWeb.h"
 
-ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr) 
+ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
   : _rf(rf), _signalMgr(signalMgr) {
   #ifdef ESP32
   _server = nullptr;
+  _dnsServer = nullptr;
   _apSSID = "ESP433RF";
   _apPassword = "12345678";
   _apStarted = false;
@@ -20,28 +21,45 @@ ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
    #ifdef ESP32
    _apSSID = String(ssid);
    _apPassword = String(password);
-   
+
    // 启动WiFi AP模式
    WiFi.mode(WIFI_AP);
    WiFi.softAP(_apSSID.c_str(), _apPassword.c_str());
    _apStarted = true;
-   
+
    Serial.printf("[WiFi] AP模式已启动\n");
    Serial.printf("[WiFi] SSID: %s\n", _apSSID.c_str());
    Serial.printf("[WiFi] 密码: %s\n", _apPassword.c_str());
    Serial.printf("[WiFi] IP地址: %s\n", WiFi.softAPIP().toString().c_str());
-   
+
+   // 启动DNS服务器（Captive Portal）
+   if (_dnsServer == nullptr) {
+     _dnsServer = new DNSServer();
+   }
+   _dnsServer->start(53, "*", WiFi.softAPIP());
+   Serial.println("[DNS] DNS服务器已启动（Captive Portal）");
+
    // 创建Web服务器
    if (_server == nullptr) {
      _server = new WebServer(80);
    }
-   
+
    // 注册路由
    _server->on("/", HTTP_GET, [this]() { this->handleRoot(); });
    _server->on("/api", HTTP_GET, [this]() { this->handleAPI(); });
    _server->on("/api", HTTP_POST, [this]() { this->handleAPI(); });
+
+   // Captive Portal 检测端点（各平台）
+   _server->on("/generate_204", HTTP_GET, [this]() { this->handleCaptivePortal(); });  // Android
+   _server->on("/gen_204", HTTP_GET, [this]() { this->handleCaptivePortal(); });       // Android
+   _server->on("/hotspot-detect.html", HTTP_GET, [this]() { this->handleCaptivePortal(); });  // iOS/macOS
+   _server->on("/canonical.html", HTTP_GET, [this]() { this->handleCaptivePortal(); });       // Firefox
+   _server->on("/success.txt", HTTP_GET, [this]() { this->handleCaptivePortal(); });          // Firefox
+   _server->on("/ncsi.txt", HTTP_GET, [this]() { this->handleCaptivePortal(); });             // Windows
+   _server->on("/connecttest.txt", HTTP_GET, [this]() { this->handleCaptivePortal(); });      // Windows
+
    _server->onNotFound([this]() { this->handleNotFound(); });
-   
+
    _server->begin();
    Serial.println("[Web] Web服务器已启动");
    #endif
@@ -49,12 +67,18 @@ ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
  
  void ESP433RFWeb::end() {
    #ifdef ESP32
+   if (_dnsServer != nullptr) {
+     _dnsServer->stop();
+     delete _dnsServer;
+     _dnsServer = nullptr;
+   }
+
    if (_server != nullptr) {
      _server->stop();
      delete _server;
      _server = nullptr;
    }
-   
+
    if (_apStarted) {
      WiFi.softAPdisconnect(true);
      _apStarted = false;
@@ -64,6 +88,9 @@ ESP433RFWeb::ESP433RFWeb(ESP433RF& rf, SignalManager& signalMgr)
  
  void ESP433RFWeb::handleClient() {
    #ifdef ESP32
+   if (_dnsServer != nullptr) {
+     _dnsServer->processNextRequest();
+   }
    if (_server != nullptr) {
      _server->handleClient();
    }
@@ -576,7 +603,21 @@ void ESP433RFWeb::handleRoot() {
 }
  
  void ESP433RFWeb::handleNotFound() {
-   sendJSONResponse(404, "页面未找到");
+   // 对于未知请求，重定向到主页（Captive Portal）
+   String host = _server->hostHeader();
+   if (host.indexOf("192.168.4.1") == -1 && host.length() > 0) {
+     // 如果请求的不是我们的 IP，重定向到主页
+     _server->sendHeader("Location", "http://192.168.4.1/", true);
+     _server->send(302, "text/plain", "");
+   } else {
+     sendJSONResponse(404, "页面未找到");
+   }
+ }
+
+ void ESP433RFWeb::handleCaptivePortal() {
+   // Captive Portal 检测端点，重定向到主页
+   _server->sendHeader("Location", "http://192.168.4.1/", true);
+   _server->send(302, "text/plain", "");
  }
  
 void ESP433RFWeb::sendJSONResponse(int code, const String& message, const String& data) {

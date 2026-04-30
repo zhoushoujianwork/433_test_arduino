@@ -17,6 +17,7 @@
 #ifdef ESP32
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #endif
 
@@ -48,16 +49,18 @@ private:
   
   #ifdef ESP32
   WebServer* _server;
+  DNSServer* _dnsServer;
   String _apSSID;
   String _apPassword;
   bool _apStarted;
   CaptureModeCallback _captureCallback;
   int8_t _bootBoundIndex;  // Boot按钮绑定的信号索引（-1表示未绑定）
-  
+
   // Web路由处理函数
   void handleRoot();
   void handleAPI();
   void handleNotFound();
+  void handleCaptivePortal();
   void sendJSONResponse(int code, const String& message, const String& data = "");
   String getSignalListJSON();
   #endif

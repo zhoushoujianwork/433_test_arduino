@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-S3 433MHz 智能遥控器 - 固件烧录工具</title>
+    <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 600px;
+            width: 100%;
+            padding: 40px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            color: #333;
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            color: #666;
+            font-size: 16px;
+            line-height: 1.6;
+        }
+
+        .device-info {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+
+        .device-info h2 {
+            color: #333;
+            font-size: 18px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+        }
+
+        .device-info h2::before {
+            content: "📱";
+            margin-right: 8px;
+        }
+
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        .info-item:last-child {
+            border-bottom: none;
+        }
+
+        .info-label {
+            color: #666;
+            font-weight: 500;
+        }
+
+        .info-value {
+            color: #333;
+            font-weight: 600;
+        }
+
+        .file-section {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+
+        .file-section h3 {
+            color: #333;
+            font-size: 16px;
+            margin-bottom: 15px;
+        }
+
+        .file-input-wrapper {
+            position: relative;
+            display: inline-block;
+            margin-bottom: 10px;
+        }
+
+        .file-input-wrapper input[type="file"] {
+            position: absolute;
+            opacity: 0;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
+
+        .file-input-label {
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 12px 30px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-weight: 600;
+        }
+
+        .file-input-label:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+        }
+
+        .file-name {
+            color: #666;
+            font-size: 14px;
+            margin-top: 10px;
+            word-break: break-all;
+        }
+
+        .file-name.selected {
+            color: #28a745;
+            font-weight: 600;
+        }
+
+        .flash-section {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .flash-button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            padding: 16px 40px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+            margin: 20px 0;
+        }
+
+        .flash-button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+        }
+
+        .flash-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .requirements {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 30px;
+        }
+
+        .requirements h3 {
+            color: #856404;
+            font-size: 16px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+        }
+
+        .requirements h3::before {
+            content: "⚠️";
+            margin-right: 8px;
+        }
+
+        .requirements ul {
+            list-style: none;
+            color: #856404;
+        }
+
+        .requirements li {
+            padding: 5px 0;
+            padding-left: 20px;
+            position: relative;
+        }
+
+        .requirements li::before {
+            content: "•";
+            position: absolute;
+            left: 5px;
+        }
+
+        .steps {
+            background: #e7f3ff;
+            border-left: 4px solid #2196F3;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 30px;
+        }
+
+        .steps h3 {
+            color: #0d47a1;
+            font-size: 16px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+        }
+
+        .steps h3::before {
+            content: "📝";
+            margin-right: 8px;
+        }
+
+        .steps ol {
+            color: #0d47a1;
+            padding-left: 20px;
+        }
+
+        .steps li {
+            padding: 5px 0;
+            line-height: 1.6;
+        }
+
+        .status-message {
+            padding: 12px;
+            border-radius: 8px;
+            margin: 15px 0;
+            font-size: 14px;
+            display: none;
+        }
+
+        .status-message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+            display: block;
+        }
+
+        .status-message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+            display: block;
+        }
+
+        .status-message.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+            display: block;
+        }
+
+        .footer {
+            text-align: center;
+            color: #666;
+            font-size: 14px;
+            padding-top: 20px;
+            border-top: 1px solid #e0e0e0;
+        }
+
+        .footer a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .footer a:hover {
+            text-decoration: underline;
+        }
+
+        .version-badge {
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-left: 10px;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 30px 20px;
+            }
+
+            .header h1 {
+                font-size: 24px;
+            }
+
+            .info-item {
+                flex-direction: column;
+                gap: 5px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>ESP32-S3 433MHz 智能遥控器</h1>
+            <p>在线固件烧录工具 - 无需安装开发环境</p>
+        </div>
+
+        <div class="device-info">
+            <h2>设备信息</h2>
+            <div class="info-item">
+                <span class="info-label">芯片型号</span>
+                <span class="info-value">ESP32-S3</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">开发板</span>
+                <span class="info-value">立创 ESP32-S3-R8N8</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">固件版本</span>
+                <span class="info-value">v2.0.0<span class="version-badge">最新</span></span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">发布日期</span>
+                <span class="info-value">2025-11-08</span>
+            </div>
+        </div>
+
+        <div class="requirements">
+            <h3>系统要求</h3>
+            <ul>
+                <li>Chrome 89+ 或 Edge 89+ 浏览器</li>
+                <li>USB 数据线（需支持数据传输）</li>
+                <li>Windows / macOS / Linux / ChromeOS</li>
+            </ul>
+        </div>
+
+        <div class="file-section">
+            <h3>步骤 1: 选择固件文件</h3>
+            <div class="file-input-wrapper">
+                <input type="file" id="firmwareFile" accept=".bin" />
+                <label for="firmwareFile" class="file-input-label">选择 firmware.bin 文件</label>
+            </div>
+            <div id="fileName" class="file-name">未选择文件</div>
+        </div>
+
+        <div class="steps">
+            <h3>步骤 2: 连接设备并烧录</h3>
+            <ol>
+                <li>使用 USB 数据线连接 ESP32-S3 开发板到电脑</li>
+                <li>点击下方"连接并烧录"按钮</li>
+                <li>在弹出窗口中选择对应的串口设备</li>
+                <li>等待烧录完成（约 1-2 分钟）</li>
+                <li>烧录完成后，设备会自动重启</li>
+            </ol>
+        </div>
+
+        <div id="statusMessage" class="status-message"></div>
+
+        <div class="flash-section">
+            <button id="flashButton" class="flash-button" disabled>连接并烧录固件</button>
+            <div id="unsupportedMessage" style="display: none; color: #dc3545; margin-top: 10px;">
+                抱歉，您的浏览器不支持 Web Serial API。<br>
+                请使用 Chrome 89+ 或 Edge 89+ 浏览器。
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>
+                项目开源地址：<a href="https://github.com/zhoushoujianwork/433_test_arduino" target="_blank">GitHub</a><br>
+                遇到问题？查看 <a href="https://github.com/zhoushoujianwork/433_test_arduino#-常见问题" target="_blank">常见问题</a>
+            </p>
+            <p style="margin-top: 10px; font-size: 12px;">
+                Made with ❤️ by Zhoushoujian
+            </p>
+        </div>
+    </div>
+
+    <script type="module">
+        import { ESPLoader } from 'https://unpkg.com/esptool-js@0.4.0/bundle.js';
+
+        let selectedFile = null;
+        const fileInput = document.getElementById('firmwareFile');
+        const fileName = document.getElementById('fileName');
+        const flashButton = document.getElementById('flashButton');
+        const statusMessage = document.getElementById('statusMessage');
+        const unsupportedMessage = document.getElementById('unsupportedMessage');
+
+        // 检查浏览器支持
+        if (!('serial' in navigator)) {
+            unsupportedMessage.style.display = 'block';
+            flashButton.style.display = 'none';
+        }
+
+        // 文件选择处理
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                selectedFile = file;
+                fileName.textContent = `已选择: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+                fileName.classList.add('selected');
+                flashButton.disabled = false;
+                showStatus('', '');
+            }
+        });
+
+        // 显示状态消息
+        function showStatus(message, type) {
+            statusMessage.textContent = message;
+            statusMessage.className = 'status-message';
+            if (type) {
+                statusMessage.classList.add(type);
+            }
+        }
+
+        // 烧录按钮处理
+        flashButton.addEventListener('click', async () => {
+            if (!selectedFile) {
+                showStatus('请先选择固件文件', 'error');
+                return;
+            }
+
+            try {
+                flashButton.disabled = true;
+                showStatus('正在连接设备...', 'info');
+
+                // 请求串口
+                const port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+
+                showStatus('正在读取固件文件...', 'info');
+
+                // 读取固件文件
+                const firmwareData = await selectedFile.arrayBuffer();
+
+                showStatus('正在烧录固件，请勿断开连接...', 'info');
+
+                // 创建 ESPLoader 实例
+                const loader = new ESPLoader({
+                    transport: {
+                        device: {
+                            readable: port.readable,
+                            writable: port.writable
+                        }
+                    },
+                    baudrate: 115200,
+                    terminal: {
+                        clean: () => {},
+                        writeLine: (line) => console.log(line),
+                        write: (text) => console.log(text)
+                    }
+                });
+
+                // 连接到设备
+                await loader.main();
+
+                // 烧录固件
+                await loader.writeFlash({
+                    fileArray: [{
+                        data: new Uint8Array(firmwareData),
+                        address: 0x0
+                    }],
+                    flashSize: 'keep',
+                    eraseAll: false,
+                    compress: true,
+                    reportProgress: (fileIndex, written, total) => {
+                        const percent = Math.round((written / total) * 100);
+                        showStatus(`烧录进度: ${percent}%`, 'info');
+                    }
+                });
+
+                // 重启设备
+                await loader.hardReset();
+
+                showStatus('烧录完成！设备正在重启...', 'success');
+
+                // 关闭串口
+                await port.close();
+
+                setTimeout(() => {
+                    flashButton.disabled = false;
+                }, 3000);
+
+            } catch (error) {
+                console.error('烧录失败:', error);
+                showStatus(`烧录失败: ${error.message}`, 'error');
+                flashButton.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
