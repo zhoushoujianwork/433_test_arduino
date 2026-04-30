@@ -30,10 +30,22 @@ bool signalCaptured = false;       // 是否已捕获信号
 // LED状态管理
 enum LEDState {
   LED_OFF,      // 熄灭（没有复刻信号）
-  LED_BLINK,    // 快闪（复刻状态，等待接收信号）
+  LED_BLINK_SLOW,    // 慢闪（复刻状态，等待第一次接收信号）
+  LED_BLINK_FAST,    // 快闪（等待第二次确认信号）
   LED_ON        // 常亮（完成复刻，已捕获信号）
 };
 LEDState currentLEDState = LED_OFF;  // 当前LED状态
+
+// 捕获状态管理（双按确认机制）
+enum CaptureState {
+  CAPTURE_IDLE,      // 空闲状态（未进入捕获模式）
+  CAPTURE_FIRST,     // 等待第一次信号
+  CAPTURE_CONFIRM    // 等待第二次确认信号
+};
+CaptureState captureState = CAPTURE_IDLE;  // 当前捕获状态
+RFSignal firstSignal = {"", ""};  // 第一次接收到的信号
+unsigned long firstSignalTime = 0;  // 第一次信号接收时间
+const unsigned long CONFIRM_TIMEOUT = 5000;  // 确认超时时间（5秒）
 
 // 全局变量
 static uint32_t sendCount = 0;
@@ -110,63 +122,103 @@ void onReceive(RFSignal signal) {
     replayBufferCount++;
   }
   
-  // 只在捕获模式下添加到信号管理器
+  // 双按确认机制：只在捕获模式下处理
   if (replayMode || rf.isCaptureMode()) {
-    // 去重：检查是否已存在相同的信号
-    bool isDuplicate = false;
-    uint8_t count = signalManager.getCount();
-    SignalItem item;
-    for (uint8_t i = 0; i < count; i++) {
-      if (signalManager.getSignal(i, item)) {
-        if (item.signal.address == signal.address && item.signal.key == signal.key) {
-          isDuplicate = true;
-          Serial.printf("[SIGNAL_MGR] 信号已存在，跳过: %s%s\n", 
+    switch (captureState) {
+      case CAPTURE_IDLE:
+        // 不应该到达这里，但为了安全起见
+        break;
+
+      case CAPTURE_FIRST:
+        // 接收到第一次信号
+        firstSignal = signal;
+        firstSignalTime = millis();
+        captureState = CAPTURE_CONFIRM;
+        currentLEDState = LED_BLINK_FAST;  // 快闪，等待第二次确认
+        Serial.printf("[CAPTURE] ✓ 第一次信号已接收: %s%s\n",
+                     signal.address.c_str(), signal.key.c_str());
+        Serial.printf("[CAPTURE] 请在5秒内再次按下遥控器相同按键进行确认\n");
+        break;
+
+      case CAPTURE_CONFIRM:
+        // 接收到第二次信号，验证是否匹配
+        if (signal.address == firstSignal.address && signal.key == firstSignal.key) {
+          // 信号匹配，确认成功
+          Serial.printf("[CAPTURE] ✓ 第二次信号匹配！信号已确认: %s%s\n",
                        signal.address.c_str(), signal.key.c_str());
-          break;
+
+          // 去重：检查是否已存在相同的信号
+          bool isDuplicate = false;
+          uint8_t count = signalManager.getCount();
+          SignalItem item;
+          for (uint8_t i = 0; i < count; i++) {
+            if (signalManager.getSignal(i, item)) {
+              if (item.signal.address == signal.address && item.signal.key == signal.key) {
+                isDuplicate = true;
+                Serial.printf("[SIGNAL_MGR] 信号已存在，跳过: %s%s\n",
+                             signal.address.c_str(), signal.key.c_str());
+                break;
+              }
+            }
+          }
+
+          // 只有不重复的信号才添加
+          if (!isDuplicate) {
+            // 生成自动名称
+            String autoName = "Signal_" + String(signalManager.getCount() + 1);
+            signalManager.addSignal(autoName, signal);
+            Serial.printf("[SIGNAL_MGR] 信号已添加到管理器: %s (%s%s)\n",
+                         autoName.c_str(), signal.address.c_str(), signal.key.c_str());
+          }
+
+          // 保存捕获的信号
+          capturedSignal = signal;
+          signalCaptured = true;
+          replayMode = false;
+          captureState = CAPTURE_IDLE;
+          currentLEDState = LED_ON;  // 完成复刻，LED常亮
+          rf.disableCaptureMode();
+
+          // 保存到闪存
+          saveSignalToFlash();
+
+          // 计算实际发送的24位数据
+          String fullHex = capturedSignal.address + capturedSignal.key;
+          uint32_t fullData = 0;
+          for (int i = 0; i < 8 && i < fullHex.length(); i++) {
+            char c = fullHex.charAt(i);
+            uint8_t val = 0;
+            if (c >= '0' && c <= '9') val = c - '0';
+            else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+            else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+            fullData = (fullData << 4) | val;
+          }
+          uint32_t code24bit = (fullData >> 8) & 0xFFFFFF;
+
+          Serial.printf("[REPLAY] ✓ 信号已捕获并确认: %s%s (地址码:%s, 按键值:%s)\n",
+                       capturedSignal.address.c_str(), capturedSignal.key.c_str(),
+                       capturedSignal.address.c_str(), capturedSignal.key.c_str());
+          Serial.printf("[REPLAY] 实际将发送: 32位=0x%08lX, 24位=0x%06lX\n", fullData, code24bit);
+          Serial.printf("[REPLAY] 现在可以按下GPIO%d按钮发送复刻信号\n", REPLAY_BUTTON_PIN);
+          Serial.printf("[REPLAY] 提示：复刻时将发送完整的8位数据 %s%s（24位编码）\n",
+                       capturedSignal.address.c_str(), capturedSignal.key.c_str());
+        } else {
+          // 信号不匹配，重新开始
+          Serial.printf("[CAPTURE] ✗ 第二次信号不匹配！\n");
+          Serial.printf("[CAPTURE]   第一次: %s%s\n",
+                       firstSignal.address.c_str(), firstSignal.key.c_str());
+          Serial.printf("[CAPTURE]   第二次: %s%s\n",
+                       signal.address.c_str(), signal.key.c_str());
+          Serial.printf("[CAPTURE] 重新开始，请再次按下遥控器按键\n");
+
+          // 重置到等待第一次信号状态
+          firstSignal = signal;  // 将当前信号作为新的第一次信号
+          firstSignalTime = millis();
+          captureState = CAPTURE_CONFIRM;
+          currentLEDState = LED_BLINK_FAST;
         }
-      }
+        break;
     }
-    
-    // 只有不重复的信号才添加
-    if (!isDuplicate) {
-      // 生成自动名称
-      String autoName = "Signal_" + String(signalManager.getCount() + 1);
-      signalManager.addSignal(autoName, signal);
-      Serial.printf("[SIGNAL_MGR] 信号已添加到管理器: %s (%s%s)\n", 
-                   autoName.c_str(), signal.address.c_str(), signal.key.c_str());
-    }
-    
-    // 捕获一个信号后自动退出捕获模式
-    capturedSignal = signal;  // 保存完整的信号（地址码+按键值）
-    signalCaptured = true;
-    replayMode = false;  // 捕获完成后退出复刻模式
-    currentLEDState = LED_ON;  // 完成复刻，LED常亮
-    rf.disableCaptureMode();  // 禁用库的捕获模式
-    Serial.println("[CAPTURE] 已退出捕获模式");
-    
-    // 保存到闪存（向后兼容）
-    saveSignalToFlash();
-    
-    // 计算实际发送的24位数据（前24位，去掉最后8位）
-    String fullHex = capturedSignal.address + capturedSignal.key;
-    uint32_t fullData = 0;
-    for (int i = 0; i < 8 && i < fullHex.length(); i++) {
-      char c = fullHex.charAt(i);
-      uint8_t val = 0;
-      if (c >= '0' && c <= '9') val = c - '0';
-      else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
-      else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
-      fullData = (fullData << 4) | val;
-    }
-    uint32_t code24bit = (fullData >> 8) & 0xFFFFFF;  // 前24位（去掉最后8位）
-    
-    Serial.printf("[REPLAY] ✓ 信号已捕获: %s%s (地址码:%s, 按键值:%s)\n", 
-                 capturedSignal.address.c_str(), capturedSignal.key.c_str(),
-                 capturedSignal.address.c_str(), capturedSignal.key.c_str());
-    Serial.printf("[REPLAY] 实际将发送: 32位=0x%08lX, 24位=0x%06lX\n", fullData, code24bit);
-    Serial.printf("[REPLAY] 现在可以按下GPIO%d按钮发送复刻信号\n", REPLAY_BUTTON_PIN);
-    Serial.printf("[REPLAY] 提示：复刻时将发送完整的8位数据 %s%s（24位编码）\n",
-                 capturedSignal.address.c_str(), capturedSignal.key.c_str());
   }
   
   // 如果有发送记录，进行验证
@@ -225,7 +277,18 @@ void receiveTask(void *parameter) {
         // 回调函数已经处理了验证逻辑
       }
     }
-    
+
+    // 检查确认超时
+    if (captureState == CAPTURE_CONFIRM) {
+      if (millis() - firstSignalTime > CONFIRM_TIMEOUT) {
+        Serial.println("[CAPTURE] ✗ 确认超时（5秒），重新开始");
+        Serial.println("[CAPTURE] 请再次按下遥控器按键");
+        captureState = CAPTURE_FIRST;
+        currentLEDState = LED_BLINK_SLOW;
+        firstSignal = {"", ""};
+      }
+    }
+
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
@@ -243,28 +306,42 @@ void statusTask(void *parameter) {
 void ledTask(void *parameter) {
   unsigned long lastBlinkTime = 0;
   bool ledBlinkState = false;
-  const unsigned long blinkInterval = 200;  // 快闪间隔200ms
-  
+  const unsigned long slowBlinkInterval = 500;  // 慢闪间隔500ms
+  const unsigned long fastBlinkInterval = 200;  // 快闪间隔200ms
+
   while (true) {
+    unsigned long currentInterval = 0;
+
     switch (currentLEDState) {
       case LED_OFF:
         digitalWrite(LED_PIN, HIGH);  // 熄灭（反向：HIGH熄灭）
         break;
-        
-      case LED_BLINK:
-        // 快闪：每200ms切换一次（反向逻辑）
-        if (millis() - lastBlinkTime >= blinkInterval) {
+
+      case LED_BLINK_SLOW:
+        // 慢闪：每500ms切换一次（等待第一次信号）
+        currentInterval = slowBlinkInterval;
+        if (millis() - lastBlinkTime >= currentInterval) {
           ledBlinkState = !ledBlinkState;
           digitalWrite(LED_PIN, ledBlinkState ? LOW : HIGH);  // 反向：LOW亮，HIGH灭
           lastBlinkTime = millis();
         }
         break;
-        
+
+      case LED_BLINK_FAST:
+        // 快闪：每200ms切换一次（等待第二次确认）
+        currentInterval = fastBlinkInterval;
+        if (millis() - lastBlinkTime >= currentInterval) {
+          ledBlinkState = !ledBlinkState;
+          digitalWrite(LED_PIN, ledBlinkState ? LOW : HIGH);  // 反向：LOW亮，HIGH灭
+          lastBlinkTime = millis();
+        }
+        break;
+
       case LED_ON:
         digitalWrite(LED_PIN, LOW);  // 常亮（反向：LOW常亮）
         break;
     }
-    
+
     vTaskDelay(pdMS_TO_TICKS(10));  // 10ms更新间隔
   }
 }
@@ -375,7 +452,9 @@ void buttonTask(void *parameter) {
           signalCaptured = false;
           capturedSignal = {"", ""};
           replayMode = true;  // 清空后自动进入复刻模式
-          currentLEDState = LED_BLINK;  // LED快闪，等待接收信号
+          captureState = CAPTURE_FIRST;  // 重置捕获状态
+          firstSignal = {"", ""};
+          currentLEDState = LED_BLINK_SLOW;  // LED慢闪，等待第一次信号
           
           // 清空闪存
           saveSignalToFlash();
@@ -426,7 +505,8 @@ void setup() {
   webManager.setCaptureModeCallback([](bool enabled) {
     if (enabled) {
       replayMode = true;
-      currentLEDState = LED_BLINK;
+      captureState = CAPTURE_FIRST;
+      currentLEDState = LED_BLINK_SLOW;
       Serial.println("[WEB] 通过Web界面进入捕获模式");
     }
   });
@@ -461,9 +541,11 @@ void setup() {
     replayMode = true;
     signalCaptured = false;
     capturedSignal = {"", ""};
-    currentLEDState = LED_BLINK;  // 进入复刻模式，LED快闪
+    captureState = CAPTURE_FIRST;  // 初始化捕获状态
+    firstSignal = {"", ""};
+    currentLEDState = LED_BLINK_SLOW;  // 进入复刻模式，LED慢闪
     Serial.println("\n[自动] 检测到没有复刻信号，自动进入复刻模式");
-    Serial.println("[自动] LED指示灯快闪中，等待接收信号...");
+    Serial.println("[自动] LED指示灯慢闪中，等待接收第一次信号...");
   } else {
     Serial.println("[自动] 已从闪存恢复复刻信号，LED常亮");
   }
@@ -521,8 +603,14 @@ void setup() {
   Serial.printf("  - 长按boot按键（GPIO%d）2秒可清空复刻信号\n", REPLAY_BUTTON_PIN);
   Serial.println("  - LED指示灯状态（反向逻辑：HIGH熄灭，LOW常亮）：");
   Serial.println("    * 熄灭（HIGH）：待机状态");
-  Serial.println("    * 快闪：捕获模式，等待接收信号");
-  Serial.println("    * 常亮（LOW）：已捕获信号");
+  Serial.println("    * 慢闪（500ms）：捕获模式，等待第一次信号");
+  Serial.println("    * 快闪（200ms）：等待第二次确认信号（5秒超时）");
+  Serial.println("    * 常亮（LOW）：已捕获并确认信号");
+  Serial.println("");
+  Serial.println("🔒 双按确认机制（抗干扰）：");
+  Serial.println("  - 第一次按下遥控器：LED变为快闪，等待确认");
+  Serial.println("  - 第二次按下相同按键：信号确认并保存");
+  Serial.println("  - 如果5秒内未确认或信号不匹配：自动重置");
   Serial.println("");
   Serial.println("📱 Web管理界面:");
   Serial.printf("  - WiFi SSID: %s\n", "ESP433RF");
